@@ -7,9 +7,10 @@ model_list:
       model: ollama/qwen3:1.7b
       api_base: http://ollama:11434
       stream: true
-      # Disable qwen3's thinking mode to prevent slow <think>...</think> blocks
-      # and keep responses fast (qwen3 emits reasoning by default).
-      think: false
+      # Enable qwen3 thinking mode. Reasoning blocks stream first, then
+      # the final answer. UI exposes them in a collapsible "Reasoning"
+      # expander so users can see how the model arrived at its answer.
+      think: true
 
   # === Embedding model ===
   - model_name: nomic-embed

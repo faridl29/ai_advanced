@@ -7,6 +7,7 @@ Premium dark-themed interface with:
 - Quick-action prompts in the empty state
 - File upload for RAG
 """
+import json
 import os
 
 import requests
@@ -15,11 +16,16 @@ import streamlit as st
 API_URL = os.getenv("API_BASE_URL", "http://app:8080")
 # Default to settings.default_model — single source of truth.
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:1.7b")
+STREAM_URL = f"{API_URL}/v1/chat/stream"
 
 
 @st.cache_data(ttl=30)
 def _fetch_available_models() -> list[str]:
-    """Fetch list of available model names from the backend.
+    """Fetch chat-capable model names from the backend.
+
+    Filters out embedding models (nomic-embed, etc.) since they cannot
+    be used for text generation — LiteLLM/Ollama will reject them with
+    "does not support generate".
 
     Returns DEFAULT_MODEL as a safe fallback if the request fails.
     """
@@ -28,6 +34,8 @@ def _fetch_available_models() -> list[str]:
         r.raise_for_status()
         data = r.json()
         names = [m.get("id", m.get("name")) for m in data.get("data", []) if m.get("id") or m.get("name")]
+        # Exclude embedding models — they only support /embeddings, not /chat/completions
+        names = [n for n in names if "embed" not in n.lower()]
         return names or [DEFAULT_MODEL]
     except Exception:
         return [DEFAULT_MODEL]
@@ -172,6 +180,29 @@ code, pre, .stCodeBlock { font-family: 'JetBrains Mono', monospace !important; }
     border-radius: 8px;
     padding: 0.75rem 1rem;
     overflow-x: auto;
+}
+
+/* Blinking cursor for streaming text */
+.cursor-blink {
+    display: inline-block;
+    color: var(--primary);
+    animation: cursorBlink 1s steps(2) infinite;
+    font-weight: 700;
+    margin-left: 1px;
+}
+@keyframes cursorBlink { 50% { opacity: 0; } }
+
+/* Reasoning block (collapsible) */
+details.reasoning {
+    transition: all 0.2s ease;
+}
+details.reasoning summary::marker { display: none; }
+details.reasoning summary::-webkit-details-marker { display: none; }
+details.reasoning summary:hover { color: var(--text) !important; }
+details.reasoning pre {
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
 }
 
 /* Glass card */
@@ -530,89 +561,191 @@ def _render_chat_bubble(role: str, content_html: str) -> None:
             )
 
 
-def _process_prompt(prompt: str, model: str, force_intent: str | None) -> None:
-    """Send a prompt to the orchestrator and update session state."""
+def _process_prompt(prompt: str, model: str) -> None:
+    """Stream a prompt to the orchestrator and render thinking + content live."""
     st.session_state.messages.append({"role": "user", "content": prompt})
-
     _render_chat_bubble("user", prompt)
 
-    typing_html = (
-        '<div class="bubble bubble-assistant">'
-        '<div class="typing-indicator">'
-        '<div class="typing-dot"></div>'
-        '<div class="typing-dot"></div>'
-        '<div class="typing-dot"></div>'
-        '<span style="margin-left:0.5rem">Thinking</span>'
-        '</div></div>'
-    )
-    typing_col, _ = st.columns([4, 1], gap="small")
-    with typing_col:
-        typing = st.empty()
-        typing.markdown(typing_html, unsafe_allow_html=True)
+    # Reserve a left-aligned column for the assistant bubble
+    bubble_col, _ = st.columns([4, 1], gap="small")
+    with bubble_col:
+        # Live containers — we mutate their content as events arrive
+        thinking_box = st.empty()
+        content_box = st.empty()
+        content_box.markdown(
+            '<div class="bubble bubble-assistant">'
+            '<div class="typing-indicator">'
+            '<div class="typing-dot"></div>'
+            '<div class="typing-dot"></div>'
+            '<div class="typing-dot"></div>'
+            '<span style="margin-left:0.5rem">Thinking</span>'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        thinking_text = ""
+        content_text = ""
+        intent_value = "direct_chat"
+        model_used = model
+        sources: list = []
+        latency_ms = 0.0
+        metadata_log: dict = {}
+
+        history = [
+            {"role": m["role"], "content": m["content"]}
+            for m in st.session_state.messages[:-1]
+        ][-10:]
+
+        def _render_bubble() -> str:
+            """Render current thinking + content as a single bubble HTML."""
+            think_html = ""
+            if thinking_text.strip():
+                # Escape HTML in reasoning
+                safe_think = (
+                    thinking_text.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                )
+                think_html = (
+                    '<details class="reasoning" open style="margin-bottom:0.85rem; '
+                    'padding:0.7rem 0.9rem; background:rgba(102,126,234,0.06); '
+                    'border:1px solid rgba(102,126,234,0.2); border-radius:10px;">'
+                    '<summary style="cursor:pointer; color:var(--text-dim); '
+                    'font-size:0.78rem; font-weight:600; user-select:none;">'
+                    '🧠 Reasoning</summary>'
+                    f'<pre style="margin:0.6rem 0 0 0; white-space:pre-wrap; '
+                    f'font-family:JetBrains Mono,monospace; font-size:0.78rem; '
+                    f'color:var(--text-dim); line-height:1.5;">{safe_think}</pre>'
+                    '</details>'
+                )
+            # Streamed markdown: just show plain-text progressive content
+            safe_content = (
+                content_text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            return (
+                f'<div class="bubble bubble-assistant">{think_html}'
+                f'<div class="bubble-content">{safe_content}'
+                '<span class="cursor-blink">▌</span></div></div>'
+            )
+
+        def _render_meta() -> str:
+            """Render metadata pills + sources."""
+            if not (intent_value or latency_ms or sources):
+                return ""
+            parts: list[str] = []
+            if intent_value:
+                parts.append(
+                    f'<span class="pill intent-{intent_value}">'
+                    f'{intent_value.replace("_", " ")}</span>'
+                )
+            if model_used:
+                parts.append(f'<span class="pill pill-info">🤖 {model_used}</span>')
+            if latency_ms:
+                kind = "success" if latency_ms < 5000 else ("info" if latency_ms < 15000 else "warning")
+                icon = "⚡" if latency_ms < 5000 else ("⏱" if latency_ms < 15000 else "🐢")
+                parts.append(f'<span class="pill pill-{kind}">{icon} {latency_ms:.0f}ms</span>')
+            for s in sources:
+                filename = s.get("filename", "unknown")
+                score = s.get("relevance_score", 0) or s.get("score", 0)
+                parts.append(
+                    f'<span class="source-chip">📄 {filename} '
+                    f'<span style="color:var(--text-mute)">· {float(score):.0%}</span></span>'
+                )
+            return (
+                '<div style="margin-top:0.85rem; display:flex; flex-wrap:wrap; '
+                f'gap:0.4rem;">{"".join(parts)}</div>'
+            )
 
         try:
-            history = [
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages[:-1]
-            ][-10:]
-
-            r = requests.post(
-                f"{API_URL}/v1/chat",
+            with requests.post(
+                STREAM_URL,
                 json={
                     "message": prompt,
                     "history": history if history else None,
                     "model": model,
-                    "force_intent": force_intent,
                 },
-                timeout=180,
-            )
+                stream=True,
+                timeout=300,
+            ) as r:
+                r.raise_for_status()
+                # SSE format: lines beginning with "data: " then blank line
+                for line in r.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data: "):
+                        continue
+                    payload = line[6:].strip()
+                    if not payload:
+                        continue
+                    try:
+                        ev = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
 
-            typing.empty()
-
-            if r.status_code == 200:
-                data = r.json()
-                answer = data.get("answer", "No response")
-                sources = data.get("sources", [])
-
-                st.markdown(
-                    f'<div class="bubble-content">{answer}</div>',
-                    unsafe_allow_html=True,
-                )
-
-                meta_html = _render_message_metadata(data)
-                if meta_html:
-                    st.markdown(
-                        f'<div style="margin-top:0.85rem; display:flex; flex-wrap:wrap; gap:0.4rem;">{meta_html}</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                sources_html = _render_sources(sources)
-                if sources_html:
-                    st.markdown(sources_html, unsafe_allow_html=True)
-
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": answer, "metadata": data, "sources": sources}
-                )
-                st.session_state.metadata_log.append(data)
-            else:
-                error_msg = f"**Error ({r.status_code})**\n\n```\n{r.text[:300]}\n```"
-                st.markdown(
-                    f'<div class="bubble-content">{error_msg}</div>',
-                    unsafe_allow_html=True,
-                )
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": error_msg, "metadata": {}}
-                )
+                    kind = ev.get("event")
+                    if kind == "metadata":
+                        intent_value = ev.get("intent", intent_value)
+                        model_used = ev.get("model_used", model_used)
+                    elif kind == "thinking":
+                        thinking_text += ev.get("delta", "")
+                        thinking_box.markdown(
+                            f'<div class="bubble bubble-assistant">'
+                            f'<div class="typing-indicator">'
+                            f'<div class="typing-dot"></div>'
+                            f'<div class="typing-dot"></div>'
+                            f'<div class="typing-dot"></div>'
+                            f'<span style="margin-left:0.5rem">Reasoning…</span>'
+                            f'</div></div>',
+                            unsafe_allow_html=True,
+                        )
+                    elif kind == "content":
+                        content_text += ev.get("delta", "")
+                        content_box.markdown(_render_bubble(), unsafe_allow_html=True)
+                    elif kind == "done":
+                        content_text = ev.get("answer", content_text)
+                        intent_value = ev.get("intent", intent_value)
+                        sources = ev.get("sources", sources)
+                        latency_ms = ev.get("latency_ms", latency_ms)
+                        model_used = ev.get("model_used", model_used)
+                        metadata_log = ev
+                        # Final render without blinking cursor
+                        final_html = _render_bubble().replace(
+                            '<span class="cursor-blink">▌</span>', ""
+                        )
+                        content_box.markdown(final_html, unsafe_allow_html=True)
+                        # Render metadata pills below
+                        st.markdown(_render_meta(), unsafe_allow_html=True)
+                    elif kind == "error":
+                        content_box.markdown(
+                            f'<div class="bubble bubble-assistant">'
+                            f'<div class="bubble-content">**Error:** '
+                            f'{ev.get("detail", "unknown")}</div></div>',
+                            unsafe_allow_html=True,
+                        )
         except Exception as e:
-            typing.empty()
-            error_msg = f"**Connection error**\n\n```\n{str(e)[:200]}\n```"
-            st.markdown(
-                f'<div class="bubble-content">{error_msg}</div>',
+            content_box.markdown(
+                f'<div class="bubble bubble-assistant">'
+                f'<div class="bubble-content">**Connection error:** '
+                f'{str(e)[:200]}</div></div>',
                 unsafe_allow_html=True,
             )
-            st.session_state.messages.append(
-                {"role": "assistant", "content": error_msg, "metadata": {}}
-            )
+
+        # Persist to session state for history re-render
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": content_text,
+                "metadata": metadata_log or {
+                    "intent": intent_value,
+                    "model_used": model_used,
+                    "latency_ms": latency_ms,
+                },
+                "sources": sources,
+                "thinking": thinking_text,
+            }
+        )
+        if metadata_log:
+            st.session_state.metadata_log.append(metadata_log)
 
 
 # ============================================================================
@@ -632,21 +765,6 @@ with st.sidebar:
 """,
         unsafe_allow_html=True,
     )
-
-    st.markdown('<div class="section-title">Routing</div>', unsafe_allow_html=True)
-    mode = st.radio(
-        "Mode",
-        ["🧠 Auto", "💬 Chat", "📄 RAG", "🤖 Agent"],
-        index=0,
-        label_visibility="collapsed",
-    )
-    force_map = {
-        "🧠 Auto": None,
-        "💬 Chat": "direct_chat",
-        "📄 RAG": "rag_query",
-        "🤖 Agent": "agent_task",
-    }
-    force_intent = force_map[mode]
 
     st.markdown('<div class="section-title">Model</div>', unsafe_allow_html=True)
     available_models = _fetch_available_models()
@@ -793,6 +911,6 @@ for msg in st.session_state.messages:
 if st.session_state.pending_prompt:
     prompt = st.session_state.pending_prompt
     st.session_state.pending_prompt = None
-    _process_prompt(prompt, model, force_intent)
-elif prompt := st.chat_input("Ask anything… (auto-routes to Chat / RAG / Agent)"):
-    _process_prompt(prompt, model, force_intent)
+    _process_prompt(prompt, model)
+elif prompt := st.chat_input("Ask anything…"):
+    _process_prompt(prompt, model)

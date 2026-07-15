@@ -10,18 +10,25 @@ Routes user messages through:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, AsyncIterator
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessageChunk
 
 from src.core.config import get_settings
 from src.services.llm import get_llm
 from src.utils.text import strip_think as _strip_think
 
 logger = logging.getLogger(__name__)
+
+# Detects an opening <think> tag in a streamed delta.
+_THINK_OPEN_RE = re.compile(r"<think>", re.IGNORECASE)
+# Detects a closing </think> tag in a streamed delta.
+_THINK_CLOSE_RE = re.compile(r"</think>", re.IGNORECASE)
 
 
 class Intent(str, Enum):
@@ -354,6 +361,199 @@ class Orchestrator:
         result.latency_ms = (time.perf_counter() - start) * 1000
 
         return result
+
+    # =====================================================================
+    # STREAMING
+    # =====================================================================
+
+    async def _build_direct_chat_messages(
+        self, message: str, history: list[dict] | None
+    ) -> list:
+        """Build message list for direct chat (shared by sync + stream paths)."""
+        messages: list = [
+            SystemMessage(
+                content=(
+                    "You are a helpful AI assistant. Answer questions clearly and concisely. "
+                    "If you don't know the answer, say so. "
+                    "Never include role labels like 'User:', 'Assistant:', 'A:', or 'System:' in your response. "
+                    "Just reply naturally."
+                )
+            )
+        ]
+        if history:
+            for msg in history[-6:]:
+                if msg["role"] == "user":
+                    messages.append(HumanMessage(content=msg["content"]))
+                else:
+                    messages.append(AIMessageChunk(content=msg["content"]))
+        messages.append(HumanMessage(content=message))
+        return messages
+
+    async def process_stream(
+        self,
+        message: str,
+        history: list[dict] | None = None,
+        model: str | None = None,
+        force_intent: str | None = None,
+    ) -> AsyncIterator[dict]:
+        """Stream a response — yields typed events.
+
+        Event shapes:
+          {"event": "metadata", "intent": "...", "model_used": "..."}
+          {"event": "thinking", "delta": "..."}    # reasoning block
+          {"event": "content", "delta": "..."}     # final answer
+          {"event": "done", "answer": "...", "sources": [...], "latency_ms": ...}
+          {"event": "error", "detail": "..."}
+        """
+        start = time.perf_counter()
+        guardrails_info: dict = {"input": {}, "output": {}}
+
+        # ----- input guardrails -----
+        from src.services.guardrails import run_input_guardrails
+
+        input_guard = run_input_guardrails(message)
+        guardrails_info["input"] = input_guard.to_dict()
+        safe_message = input_guard.redacted_text or message
+
+        if input_guard.blocked:
+            elapsed = (time.perf_counter() - start) * 1000
+            yield {
+                "event": "done",
+                "answer": "I can't help with that request. It was flagged by content safety filters.",
+                "intent": Intent.BLOCKED.value,
+                "sources": [],
+                "tools_used": [],
+                "guardrails": guardrails_info,
+                "latency_ms": elapsed,
+            }
+            return
+
+        if not input_guard.blocked:
+            is_safe, reason = await self.check_input_safety(safe_message)
+            if not is_safe:
+                elapsed = (time.perf_counter() - start) * 1000
+                guardrails_info["input"]["llm_safety"] = {"passed": False, "reason": reason}
+                yield {
+                    "event": "done",
+                    "answer": "I can't help with that request. Please ask something appropriate.",
+                    "intent": Intent.BLOCKED.value,
+                    "sources": [],
+                    "tools_used": [],
+                    "guardrails": guardrails_info,
+                    "latency_ms": elapsed,
+                }
+                return
+
+        # ----- intent classification -----
+        if force_intent:
+            intent = Intent(force_intent)
+        else:
+            intent = await self.classify_intent(safe_message, history)
+
+        # Currently only direct_chat is streamed end-to-end. Other intents
+        # fall back to non-streaming execution and we emit a single 'done'.
+        if intent != Intent.DIRECT_CHAT:
+            try:
+                if intent == Intent.RAG_QUERY:
+                    result = await self._execute_rag_query(safe_message, history, model)
+                else:
+                    result = await self._execute_agent_task(safe_message, history, model)
+
+                from src.services.guardrails import run_output_guardrails
+
+                out_guard = run_output_guardrails(result.answer)
+                guardrails_info["output"] = out_guard.to_dict()
+                if out_guard.redacted_text:
+                    result.answer = out_guard.redacted_text
+                result.guardrails = guardrails_info
+                result.latency_ms = (time.perf_counter() - start) * 1000
+                yield {
+                    "event": "done",
+                    **result.to_dict(),
+                }
+            except Exception as e:
+                yield {"event": "error", "detail": str(e)}
+            return
+
+        # ----- direct chat streaming -----
+        yield {
+            "event": "metadata",
+            "intent": intent.value,
+            "model_used": model or self._settings.default_model,
+        }
+
+        try:
+            llm = get_llm("chat", model=model, streaming=True)
+            messages = await self._build_direct_chat_messages(safe_message, history)
+
+            # Stream chunks, split `` from content
+            in_think = False
+            full_answer = ""
+            async for chunk in llm.astream(messages):
+                delta = chunk.content if isinstance(chunk.content, str) else ""
+                if not delta:
+                    continue
+
+                # Transition: detect <think> opening
+                if not in_think and "<think>" in delta:
+                    parts = delta.split("<think>", 1)
+                    before, after = parts[0], parts[1]
+                    if before:
+                        full_answer += before
+                        yield {"event": "content", "delta": before}
+                    in_think = True
+                    # Handle everything after <think> as thinking
+                    if "</think>" in after:
+                        closed = after.split("</think>", 1)
+                        yield {"event": "thinking", "delta": closed[0]}
+                        rest = closed[1]
+                        if rest:
+                            full_answer += rest
+                            yield {"event": "content", "delta": rest}
+                        in_think = False
+                    else:
+                        yield {"event": "thinking", "delta": after}
+                    continue
+
+                # Transition: detect </think> closing
+                if in_think and "</think>" in delta:
+                    parts = delta.split("</think>", 1)
+                    yield {"event": "thinking", "delta": parts[0]}
+                    rest = parts[1]
+                    in_think = False
+                    if rest:
+                        full_answer += rest
+                        yield {"event": "content", "delta": rest}
+                    continue
+
+                # Default: route to current stream
+                if in_think:
+                    yield {"event": "thinking", "delta": delta}
+                else:
+                    full_answer += delta
+                    yield {"event": "content", "delta": delta}
+
+            # ----- output guardrails -----
+            from src.services.guardrails import run_output_guardrails
+
+            out_guard = run_output_guardrails(full_answer)
+            guardrails_info["output"] = out_guard.to_dict()
+            final_answer = out_guard.redacted_text or full_answer
+
+            elapsed = (time.perf_counter() - start) * 1000
+            yield {
+                "event": "done",
+                "answer": final_answer,
+                "intent": intent.value,
+                "sources": [],
+                "tools_used": [],
+                "guardrails": guardrails_info,
+                "latency_ms": elapsed,
+                "model_used": model or self._settings.default_model,
+            }
+        except Exception as e:
+            logger.exception("Streaming failed")
+            yield {"event": "error", "detail": str(e)}
 
 
 # Singleton
