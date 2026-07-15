@@ -1,0 +1,243 @@
+# ==============================================================================
+# AI Platform — Docker Compose (On-Premise, CPU-only, 8-16 GB RAM)
+# ==============================================================================
+# Usage:
+#   make up         → start core stack (postgres, redis, ollama, litellm, app)
+#   make up-full    → start full stack (+ langfuse, qdrant)
+#   make down       → stop everything
+#   make health     → check all services
+#   make chat       → quick chat test
+# ==============================================================================
+
+name: ai-platform
+
+services:
+  # ============================================================================
+  # INFRASTRUCTURE
+  # ============================================================================
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_platform}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    mem_limit: 512m
+    networks:
+      - ai-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-redis
+    command: >
+      redis-server
+      --maxmemory 200mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1
+    volumes:
+      - ./data/redis:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    mem_limit: 256m
+    networks:
+      - ai-net
+
+  # ============================================================================
+  # TAHAP 1: LOCAL LLM
+  # ============================================================================
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai-ollama
+    volumes:
+      - ./models:/root/.ollama
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KEEP_ALIVE: "5m"
+      OLLAMA_HOST: "0.0.0.0:11434"
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    mem_limit: 6g
+    cpus: "3"
+    networks:
+      - ai-net
+
+  # ============================================================================
+  # TAHAP 2: AI ROUTER
+  # ============================================================================
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: ai-litellm
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ai}:${POSTGRES_PASSWORD:-ai_secret}@postgres:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-dev-master-key}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-sk-dev-salt}
+      STORE_MODEL_IN_DB: "True"
+      LANGFUSE_HOST: http://langfuse:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3)\""]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    mem_limit: 2g
+    networks:
+      - ai-net
+
+  # ============================================================================
+  # TAHAP 3: FASTAPI APP
+  # ============================================================================
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: ai-app
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-dev}
+      LITELLM_BASE_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-dev-master-key}
+      OLLAMA_BASE_URL: http://ollama:11434
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379
+      POSTGRES_URL: postgresql+asyncpg://${POSTGRES_USER:-ai}:${POSTGRES_PASSWORD:-ai_secret}@postgres:5432/${POSTGRES_DB:-ai_platform}
+      LANGFUSE_HOST: http://langfuse:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-phi3}
+    ports:
+      - "8080:8080"
+    depends_on:
+      litellm:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    mem_limit: 1g
+    networks:
+      - ai-net
+
+  # ============================================================================
+  # TAHAP 4: OBSERVABILITY (profile: full)
+  # ============================================================================
+
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: ai-langfuse
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ai}:${POSTGRES_PASSWORD:-ai_secret}@postgres:5432/langfuse
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-change-me-nextauth-secret-32chars}
+      NEXTAUTH_URL: http://localhost:3000
+      SALT: ${LANGFUSE_SALT:-change-me-langfuse-salt-32chars}
+      TELEMETRY_ENABLED: "false"
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 1g
+    networks:
+      - ai-net
+
+  # ============================================================================
+  # TAHAP 5: VECTOR DB (profile: full)
+  # ============================================================================
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ai-qdrant
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    ports:
+      - "6333:6333"
+    restart: unless-stopped
+    mem_limit: 512m
+    networks:
+      - ai-net
+
+  # ============================================================================
+  # TAHAP 8: UI + REVERSE PROXY
+  # ============================================================================
+
+  ui:
+    build: ./ui
+    container_name: ai-ui
+    environment:
+      API_BASE_URL: http://app:8080
+    ports:
+      - "8501:8501"
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 512m
+    networks:
+      - ai-net
+
+  nginx:
+    image: nginx:alpine
+    container_name: ai-nginx
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    ports:
+      - "8000:80"
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 128m
+    networks:
+      - ai-net
+
+networks:
+  ai-net:
+    driver: bridge
