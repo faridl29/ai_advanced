@@ -174,14 +174,16 @@ class Orchestrator:
 
         messages = [
             SystemMessage(content=(
-                "You are a helpful AI assistant. Answer questions clearly and concisely. "
-                "If you don't know something, say so. Use Indonesian or English based on user's language."
+                "You are a helpful AI assistant. Answer questions clearly and concisely "
+                "in English. If you don't know the answer, say so. "
+                "Never include role labels like 'User:', 'Assistant:', 'A:', or 'System:' in your response. "
+                "Just reply naturally."
             ))
         ]
 
         # Add conversation history
         if history:
-            for msg in history[-10:]:  # Last 10 messages max
+            for msg in history[-6:]:  # Last 6 messages max
                 if msg["role"] == "user":
                     messages.append(HumanMessage(content=msg["content"]))
                 else:

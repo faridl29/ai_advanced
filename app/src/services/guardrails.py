@@ -83,7 +83,7 @@ def detect_pii_presidio(text: str, language: str = "en") -> list[dict]:
             "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD",
             "IBAN_CODE", "IP_ADDRESS", "LOCATION", "DATE_TIME",
         ],
-        score_threshold=0.4,
+        score_threshold=0.75,
     )
 
     return [
@@ -124,7 +124,7 @@ def redact_pii(text: str, language: str = "en") -> tuple[str, list[dict]]:
     anonymizer = _get_anonymizer()
     if anonymizer and _PRESIDIO_AVAILABLE:
         analyzer = _get_analyzer()
-        results = analyzer.analyze(text=text, language=language, score_threshold=0.4)
+        results = analyzer.analyze(text=text, language=language, score_threshold=0.75)
         anonymized = anonymizer.anonymize(text=text, analyzer_results=results)
         return anonymized.text, entities
 
@@ -305,7 +305,11 @@ def run_output_guardrails(text: str) -> GuardrailResult:
     """
     Output guardrail pipeline:
     1. Length check
-    2. PII detection + redaction (prevent leaking PII in responses)
+
+    Note: PII redaction is NOT applied to LLM output because the spacy
+    en_core_web_sm model produces too many false positives on non-English
+    (e.g. Indonesian) text, incorrectly masking normal words as PERSON/LOCATION.
+    Input guardrails still protect user-submitted PII.
     """
     result = GuardrailResult()
 
@@ -314,17 +318,6 @@ def run_output_guardrails(text: str) -> GuardrailResult:
     result.checks.append({"name": "max_length", "passed": ok, "detail": detail})
     if not ok:
         result.passed = False
-
-    # 2. PII in output
-    redacted, entities = redact_pii(text)
-    result.pii_entities = entities
-    result.checks.append({
-        "name": "pii_detection",
-        "passed": True,
-        "detail": f"Redacted {len(entities)} PII entities from output" if entities else None,
-    })
-    if entities:
-        result.redacted_text = redacted
 
     return result
 

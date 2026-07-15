@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     environment: Literal["dev", "staging", "prod"] = "dev"
 
     # LLM
-    default_model: str = "phi3"
+    default_model: str = "qwen2.5"
     litellm_base_url: str = "http://litellm:4000"
     litellm_master_key: str = "sk-dev-master-key"
     ollama_base_url: str = "http://ollama:11434"
