@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, models
 
 from src.core.config import get_settings
+from src.services.llm import get_llm
+from src.utils.text import strip_think as _strip_think
 
 logger = logging.getLogger(__name__)
 
@@ -205,9 +208,6 @@ async def query_rag_with_answer(
     """
     Full RAG pipeline: retrieve + generate answer with source citations.
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
-    from langchain_openai import ChatOpenAI
-
     s = get_settings()
 
     # Step 1: Retrieve relevant chunks
@@ -250,22 +250,18 @@ RULES:
 - Be concise but thorough
 - If the question is in Indonesian, answer in Indonesian
 
-QUESTION: {query}"""
+QUESTION: {query} /no_think"""
 
-    llm = ChatOpenAI(
-        model=model or s.default_model,
-        base_url=f"{s.litellm_base_url}/v1",
-        api_key=s.litellm_master_key,
-        temperature=0.3,
-        max_tokens=1024,
-    )
+    llm = get_llm("rag", model=model)
 
     response = llm.invoke([
         HumanMessage(content=rag_prompt),
     ])
 
+    answer_text = _strip_think(response.content)
+
     return {
-        "answer": response.content,
+        "answer": answer_text,
         "sources": sources,
         "chunks": chunks,
         "query": query,

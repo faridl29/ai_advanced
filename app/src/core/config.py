@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     environment: Literal["dev", "staging", "prod"] = "dev"
 
     # LLM
-    default_model: str = "qwen2.5"
+    default_model: str = "qwen3:1.7b"
     litellm_base_url: str = "http://litellm:4000"
     litellm_master_key: str = "sk-dev-master-key"
     ollama_base_url: str = "http://ollama:11434"
@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     request_timeout: int = 120
 
     # Agent
-    agent_model: str = "qwen2.5"
+    agent_model: str = "qwen3:1.7b"
 
 
 @lru_cache

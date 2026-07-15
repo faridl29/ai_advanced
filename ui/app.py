@@ -7,12 +7,31 @@ Single chat interface that:
 - Supports file upload for RAG
 """
 import json
+import os
 import time
 
 import requests
 import streamlit as st
 
-API_URL = "http://app:8080"
+API_URL = os.getenv("API_BASE_URL", "http://app:8080")
+# Default to settings.default_model — single source of truth.
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:1.7b")
+
+
+@st.cache_data(ttl=30)
+def _fetch_available_models() -> list[str]:
+    """Fetch list of available model names from the backend.
+
+    Returns DEFAULT_MODEL as a safe fallback if the request fails.
+    """
+    try:
+        r = requests.get(f"{API_URL}/v1/models", timeout=3)
+        r.raise_for_status()
+        data = r.json()
+        names = [m.get("id", m.get("name")) for m in data.get("data", []) if m.get("id") or m.get("name")]
+        return names or [DEFAULT_MODEL]
+    except Exception:
+        return [DEFAULT_MODEL]
 
 st.set_page_config(
     page_title="AI Platform",
@@ -117,8 +136,10 @@ with st.sidebar:
 
     st.divider()
 
-    # Model selection
-    model = st.selectbox("Model", ["phi3", "qwen2.5", "gemma3", "llama3.2"], index=0)
+    # Model selection — pull live list from backend to stay in sync.
+    available_models = _fetch_available_models()
+    default_idx = available_models.index(DEFAULT_MODEL) if DEFAULT_MODEL in available_models else 0
+    model = st.selectbox("Model", available_models, index=default_idx)
 
     st.divider()
 

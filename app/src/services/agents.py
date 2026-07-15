@@ -171,10 +171,10 @@ TOOLS = [calculator, current_datetime, knowledge_base, web_search, python_execut
 # =============================================================================
 
 def _get_agent_llm(model: str | None = None) -> ChatOpenAI:
-    """Create LLM optimized for tool calling (uses qwen2.5 by default)."""
+    """Create LLM optimized for tool calling (uses qwen3:4b by default)."""
     s = get_settings()
     return ChatOpenAI(
-        model=model or "qwen2.5",  # qwen2.5 is much better at tool calling
+        model=model or "qwen3:4b",  # qwen3:4b has thinking mode + better tool calling
         base_url=f"{s.litellm_base_url}/v1",
         api_key=s.litellm_master_key,
         temperature=0.1,
@@ -374,7 +374,7 @@ async def run_agent(
             "steps": len([m for m in result_messages if isinstance(m, (AIMessage, ToolMessage))]),
             "reasoning": reasoning_steps,
             "task": task,
-            "model": model or "qwen2.5",
+            "model": model or "qwen3:4b",
         }
 
     except Exception as e:

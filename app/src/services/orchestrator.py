@@ -15,11 +15,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-import httpx
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from src.core.config import get_settings
+from src.services.llm import get_llm
+from src.utils.text import strip_think as _strip_think
 
 logger = logging.getLogger(__name__)
 
@@ -100,33 +100,12 @@ class Orchestrator:
 
     def __init__(self):
         self._settings = get_settings()
-        self._llm: ChatOpenAI | None = None
-        self._classifier_llm: ChatOpenAI | None = None
+        self._classifier_llm = None
 
-    def _get_llm(self, model: str | None = None) -> ChatOpenAI:
-        """Get LLM client for generation."""
-        s = self._settings
-        return ChatOpenAI(
-            model=model or s.default_model,
-            base_url=f"{s.litellm_base_url}/v1",
-            api_key=s.litellm_master_key,
-            temperature=0.7,
-            max_tokens=1024,
-            request_timeout=90,
-        )
-
-    def _get_classifier(self) -> ChatOpenAI:
+    def _get_classifier(self):
         """Get fast LLM for classification tasks (low temp, short output)."""
         if self._classifier_llm is None:
-            s = self._settings
-            self._classifier_llm = ChatOpenAI(
-                model=s.default_model,
-                base_url=f"{s.litellm_base_url}/v1",
-                api_key=s.litellm_master_key,
-                temperature=0.0,
-                max_tokens=20,
-                request_timeout=60,
-            )
+            self._classifier_llm = get_llm("classifier")
         return self._classifier_llm
 
     async def classify_intent(self, message: str, history: list[dict] | None = None) -> Intent:
@@ -170,14 +149,14 @@ class Orchestrator:
         self, message: str, history: list[dict] | None = None, model: str | None = None
     ) -> OrchestratorResult:
         """Direct chat — simple LLM completion."""
-        llm = self._get_llm(model)
+        llm = get_llm("chat", model=model) if model else get_llm("chat")
 
         messages = [
             SystemMessage(content=(
                 "You are a helpful AI assistant. Answer questions clearly and concisely "
                 "in English. If you don't know the answer, say so. "
                 "Never include role labels like 'User:', 'Assistant:', 'A:', or 'System:' in your response. "
-                "Just reply naturally."
+                "Just reply naturally. /no_think"
             ))
         ]
 
@@ -194,7 +173,7 @@ class Orchestrator:
 
         response = llm.invoke(messages)
         return OrchestratorResult(
-            answer=response.content,
+            answer=_strip_think(response.content),
             intent=Intent.DIRECT_CHAT,
             model_used=model or self._settings.default_model,
         )
@@ -235,7 +214,7 @@ class Orchestrator:
         context = "\n\n".join(context_parts)
 
         # Generate answer with context
-        llm = self._get_llm(model)
+        llm = get_llm("rag", model=model) if model else get_llm("rag")
         response = llm.invoke([
             SystemMessage(content=(
                 "You are a helpful AI assistant that answers questions based on provided context. "
@@ -267,7 +246,7 @@ class Orchestrator:
             return OrchestratorResult(
                 answer=agent_result.get("answer", "Agent could not produce an answer"),
                 intent=Intent.AGENT_TASK,
-                model_used=agent_result.get("model", model or "qwen2.5"),
+                model_used=agent_result.get("model", model or "qwen3:4b"),
                 tools_used=agent_result.get("tools_used", []),
                 metadata={"steps": agent_result.get("steps", 0)},
             )

@@ -146,7 +146,7 @@ services:
       LANGFUSE_HOST: http://langfuse:3000
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
-      DEFAULT_MODEL: ${DEFAULT_MODEL:-phi3}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-qwen3:4b}
     ports:
       - "8080:8080"
     depends_on:
@@ -213,6 +213,7 @@ services:
     container_name: ai-ui
     environment:
       API_BASE_URL: http://app:8080
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-qwen3:1.7b}
     ports:
       - "8501:8501"
     depends_on:

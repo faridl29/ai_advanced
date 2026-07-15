@@ -2,37 +2,14 @@
 # All models route through Ollama running on same Docker network
 
 model_list:
-  # === Primary models (small, CPU-friendly) ===
-  - model_name: phi3
+  - model_name: qwen3:1.7b
     litellm_params:
-      model: ollama/phi3:mini
+      model: ollama/qwen3:1.7b
       api_base: http://ollama:11434
       stream: true
-
-  - model_name: qwen2.5
-    litellm_params:
-      model: ollama/qwen2.5:3b
-      api_base: http://ollama:11434
-      stream: true
-
-  - model_name: gemma3
-    litellm_params:
-      model: ollama/gemma3:4b
-      api_base: http://ollama:11434
-      stream: true
-
-  - model_name: llama3.2
-    litellm_params:
-      model: ollama/llama3.2:3b
-      api_base: http://ollama:11434
-      stream: true
-
-  # === Medium model (16 GB only) ===
-  - model_name: mistral
-    litellm_params:
-      model: ollama/mistral:7b-instruct-q4_K_M
-      api_base: http://ollama:11434
-      stream: true
+      # Disable qwen3's thinking mode to prevent slow <think>...</think> blocks
+      # and keep responses fast (qwen3 emits reasoning by default).
+      think: false
 
   # === Embedding model ===
   - model_name: nomic-embed
