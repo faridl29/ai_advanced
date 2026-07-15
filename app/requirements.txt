@@ -29,3 +29,6 @@ spacy>=3.7
 
 # Evaluation — LLM-as-judge (no external API needed)
 # Uses langchain-openai for LLM calls (already included)
+
+# Observability — Langfuse prompt management + tracing
+langfuse>=2.50

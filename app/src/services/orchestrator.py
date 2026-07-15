@@ -63,7 +63,7 @@ class OrchestratorResult:
         }
 
 
-# Intent classification prompt
+# Intent classification prompt (FALLBACK — managed in Langfuse as "intent-classifier")
 INTENT_SYSTEM_PROMPT = """You are an intent classifier for an AI platform. Classify the user's message into exactly one category.
 
 Categories:
@@ -80,6 +80,7 @@ Rules:
 Respond with ONLY the category name, nothing else."""
 
 
+# Safety check prompt (FALLBACK — managed in Langfuse as "safety-check")
 GUARDRAIL_SYSTEM_PROMPT = """You are a content safety classifier. Analyze the user's message and determine if it's safe.
 
 UNSAFE content includes:
@@ -100,6 +101,15 @@ Respond with exactly one word:
 - UNSAFE: if the content violates safety guidelines
 
 Be strict but reasonable. When in doubt, lean toward SAFE."""
+
+
+def _load_prompt(name: str, fallback: str) -> str:
+    """Fetch prompt from Langfuse with fallback. Cached for 30s.
+
+    Imported here to avoid circular imports during module load.
+    """
+    from src.services.prompts import get_prompt
+    return get_prompt(name, fallback)
 
 
 class Orchestrator:
