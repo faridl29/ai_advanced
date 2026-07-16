@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379"
     postgres_url: str = "postgresql+asyncpg://ai:ai_secret@postgres:5432/ai_platform"
     qdrant_url: str = "http://qdrant:6333"
+    searxng_url: str = "http://searxng:8080"
 
     # Langfuse (Tahap 4)
     langfuse_host: str = "http://langfuse:3000"
@@ -42,7 +43,7 @@ class Settings(BaseSettings):
     agent_temperature: float = 0.1
     agent_max_tokens: int = 2048
     agent_stream: bool = True
-    agent_reflect: bool = False  # Reflection node (verify answer before emit)
+    agent_reflect: bool = True  # Reflection node (verify answer before emit)
     agent_think_tool: bool = False  # Disabled: think tool causes loops di small models
 
     # Memory backend

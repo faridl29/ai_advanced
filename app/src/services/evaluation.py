@@ -17,85 +17,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from src.core.config import get_settings
+from src.services.prompts import get_prompt
 
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# LLM-AS-JUDGE PROMPTS
-# =============================================================================
-
-FAITHFULNESS_PROMPT = """You are evaluating whether an AI response is faithful to the provided context.
-
-CONTEXT:
-{context}
-
-RESPONSE:
-{response}
-
-Evaluate faithfulness on a scale of 0.0 to 1.0:
-- 1.0: Every claim in the response is supported by the context
-- 0.7: Most claims are supported, minor unsupported additions
-- 0.5: Mix of supported and unsupported claims
-- 0.3: Mostly unsupported claims
-- 0.0: Response contradicts or fabricates information
-
-Respond in this exact JSON format:
-{{"score": <float>, "reason": "<one sentence explanation>"}}"""
-
-
-RELEVANCY_PROMPT = """You are evaluating whether an AI response is relevant to the user's question.
-
-QUESTION:
-{query}
-
-RESPONSE:
-{response}
-
-Evaluate relevancy on a scale of 0.0 to 1.0:
-- 1.0: Response directly and completely answers the question
-- 0.7: Response mostly answers the question with some tangents
-- 0.5: Response partially answers the question
-- 0.3: Response barely relates to the question
-- 0.0: Response is completely irrelevant
-
-Respond in this exact JSON format:
-{{"score": <float>, "reason": "<one sentence explanation>"}}"""
-
-
-CONTEXTUAL_PRECISION_PROMPT = """You are evaluating whether the retrieved context chunks are relevant to answering the question.
-
-QUESTION:
-{query}
-
-RETRIEVED CHUNKS:
-{context}
-
-Evaluate contextual precision on a scale of 0.0 to 1.0:
-- 1.0: All retrieved chunks are highly relevant to the question
-- 0.7: Most chunks are relevant, a few are noise
-- 0.5: About half the chunks are relevant
-- 0.3: Only a few chunks are relevant
-- 0.0: None of the chunks are relevant
-
-Respond in this exact JSON format:
-{{"score": <float>, "reason": "<one sentence explanation>"}}"""
-
-
-COHERENCE_PROMPT = """You are evaluating the coherence and quality of an AI response.
-
-RESPONSE:
-{response}
-
-Evaluate coherence on a scale of 0.0 to 1.0:
-- 1.0: Clear, well-structured, logically flowing, easy to understand
-- 0.7: Mostly clear with minor structural issues
-- 0.5: Understandable but disorganized or repetitive
-- 0.3: Confusing or poorly structured
-- 0.0: Incoherent or incomprehensible
-
-Respond in this exact JSON format:
-{{"score": <float>, "reason": "<one sentence explanation>"}}"""
+# Prompts are managed in Langfuse. Below is the Evaluator class.
 
 
 # =============================================================================
@@ -150,7 +77,8 @@ class LLMEvaluator:
         if not context:
             return {"score": 0.5, "reason": "No context provided for faithfulness check"}
 
-        prompt = FAITHFULNESS_PROMPT.format(
+        prompt_tmpl = get_prompt("eval-faithfulness")
+        prompt = prompt_tmpl.format(
             context="\n---\n".join(context),
             response=response,
         )
@@ -158,7 +86,8 @@ class LLMEvaluator:
 
     def evaluate_relevancy(self, query: str, response: str) -> dict:
         """Evaluate if response is relevant to the question."""
-        prompt = RELEVANCY_PROMPT.format(query=query, response=response)
+        prompt_tmpl = get_prompt("eval-relevancy")
+        prompt = prompt_tmpl.format(query=query, response=response)
         return self._call_judge(prompt)
 
     def evaluate_contextual_precision(self, query: str, context: list[str]) -> dict:
@@ -166,7 +95,8 @@ class LLMEvaluator:
         if not context:
             return {"score": 0.0, "reason": "No context chunks retrieved"}
 
-        prompt = CONTEXTUAL_PRECISION_PROMPT.format(
+        prompt_tmpl = get_prompt("eval-contextual-precision")
+        prompt = prompt_tmpl.format(
             query=query,
             context="\n---\n".join(context),
         )
@@ -174,7 +104,8 @@ class LLMEvaluator:
 
     def evaluate_coherence(self, response: str) -> dict:
         """Evaluate response coherence and structure."""
-        prompt = COHERENCE_PROMPT.format(response=response)
+        prompt_tmpl = get_prompt("eval-coherence")
+        prompt = prompt_tmpl.format(response=response)
         return self._call_judge(prompt)
 
 

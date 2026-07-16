@@ -54,7 +54,7 @@ def _get_client() -> Langfuse | None:
 
 def get_prompt(
     name: str,
-    fallback: str,
+    fallback: str | None = None,
     *,
     label: str | None = None,
     version: int | None = None,
@@ -63,7 +63,7 @@ def get_prompt(
 
     Args:
         name: Prompt name in Langfuse (e.g. "intent-classifier").
-        fallback: Local fallback used if Langfuse is down or prompt missing.
+        fallback: Optional local fallback used if Langfuse is down or prompt missing.
         label: Optional label filter (e.g. "production", "staging").
         version: Optional explicit version. If None, latest.
 
@@ -89,9 +89,15 @@ def get_prompt(
             logger.info(f"Loaded prompt '{name}' from Langfuse (label={label}, version={version})")
             return text
         except Exception as e:
-            logger.warning(f"Failed to load prompt '{name}' from Langfuse: {e}. Using fallback.")
+            if fallback is not None:
+                logger.warning(f"Failed to load prompt '{name}' from Langfuse: {e}. Using fallback.")
+            else:
+                logger.error(f"Failed to load prompt '{name}' from Langfuse: {e}. No fallback provided.")
+                raise ValueError(f"Prompt '{name}' could not be fetched from Langfuse, and no fallback was provided.") from e
 
-    return fallback
+    if fallback is not None:
+        return fallback
+    raise ValueError(f"Langfuse client is not initialized and prompt '{name}' has no fallback.")
 
 
 def invalidate_cache() -> None:

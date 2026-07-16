@@ -29,7 +29,7 @@ from typing_extensions import TypedDict
 
 from src.core.config import get_settings
 from src.services.llm import get_llm
-from src.services.memory import get_memory
+from src.services.memory import get_memory, get_profile_memory
 from src.services.prompts import get_prompt
 from src.services.tools import get_tools
 from src.utils.text import strip_think as _strip_think
@@ -48,48 +48,15 @@ class AgentState(TypedDict, total=False):
     tool_calls_count: int
     error_count: int
     reasoning_steps: list[dict]  # observability trace
+    reflection_attempts: int
 
 
 # =============================================================================
 # PROMPTS
 # =============================================================================
 
-AGENT_SYSTEM_FALLBACK = """You are a helpful AI assistant with access to tools. Use them to provide accurate answers.
-
-You have access to these tools:
-- calculator: For math operations (expressions like "2+2", "sqrt(144)")
-- python_executor: For complex calculations, data processing, or string manipulation
-- knowledge_base: To search uploaded documents and internal knowledge
-- web_search: To search the web for current information
-- current_datetime: For current date/time info
-- think: Your private scratchpad for chain-of-thought (NOT shown to user)
-- financial_analyzer: Compute financial ratios (ROE, ROA, DER, etc.) and investment assessment from JSON data
-- generate_excel_report: Generate a downloadable Excel (.xlsx) report from financial analysis results
-
-DECISION RULES:
-1. For math questions → ALWAYS use calculator or python_executor
-2. For questions about documents/files/company data → use knowledge_base FIRST
-3. For date/time questions → use current_datetime
-4. For recent events → use web_search
-5. For complex multi-step tasks → use think first to plan, then call other tools
-6. You can call MULTIPLE tools in sequence (e.g. knowledge_base → financial_analyzer → generate_excel_report)
-7. If a tool returns an error, try a different tool or answer from your own knowledge
-8. After all needed tool calls, give a clear final answer in the user's language
-
-FINANCIAL ANALYSIS RULES:
-9. When user asks about financial analysis, ratios, or investment assessment:
-   a. FIRST use knowledge_base to retrieve the financial data from uploaded documents
-   b. THEN extract key figures (revenue, net_income, total_assets, total_equity, etc.)
-   c. THEN call financial_analyzer with the extracted data as JSON
-   d. If user asks for Excel/download, THEN call generate_excel_report with the analysis output
-10. Always format financial data as markdown tables in your final answer
-11. When presenting financial figures, use proper number formatting (e.g. Rp 500.000.000 or 500M)
-
-Answer in the same language as the user's question. Be concise but thorough."""
-
-
 def _load_agent_prompt() -> str:
-    return get_prompt("agent-system", AGENT_SYSTEM_FALLBACK)
+    return get_prompt("agent-system")
 
 
 # =============================================================================
@@ -198,10 +165,93 @@ def _track_tool_results(state: AgentState) -> dict:
     return {"reasoning_steps": steps}
 
 
-def _reflect(state: AgentState) -> dict:
-    """Optional: verify the final answer. Currently a no-op stub."""
-    # Future: use a lightweight LLM call to check groundedness / quality
-    return {}
+async def _reflect(state: AgentState) -> dict:
+    """Verify the final answer using LLM-as-judge metrics (faithfulness, coherence)."""
+    messages = state.get("messages", [])
+    attempts = state.get("reflection_attempts", 0)
+    
+    # Extract original query
+    query = ""
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            # Skip reflection corrections/feedback messages when finding original query
+            if "[Koreksi Refleksi Mandiri]" not in m.content:
+                query = m.content
+                break
+            
+    # Extract final answer
+    response = ""
+    for m in reversed(messages):
+        if isinstance(m, AIMessage):
+            if not getattr(m, "tool_calls", None): # skip if it's a tool-calling intermediate message
+                response = m.content
+                break
+                
+    if not response or not query:
+        logger.info("Skipping reflection: query or response not found")
+        return {"reflection_attempts": attempts}
+
+    # Extract retrieved context chunks from ToolMessages (for RAG faithfulness check)
+    from langchain_core.messages import ToolMessage
+    context = []
+    for m in messages:
+        if isinstance(m, ToolMessage) and m.name == "knowledge_base":
+            context.append(m.content)
+
+    logger.info(f"Running reflection checks for query: '{query[:50]}...' with {len(context)} context chunks (attempt {attempts + 1})")
+    
+    from src.services.evaluation import evaluate_response
+    
+    # If context is available, check faithfulness, otherwise check coherence
+    metrics = ["coherence"]
+    if context:
+        metrics.append("faithfulness")
+        
+    try:
+        eval_result = await evaluate_response(
+            query=query,
+            response=response,
+            context=context if context else None,
+            metrics=metrics,
+        )
+        
+        overall_score = eval_result.get("overall_score", 1.0)
+        passed = eval_result.get("passed", True)
+        
+        logger.info(f"Reflection score: {overall_score} (passed={passed})")
+        
+        if not passed and attempts < 1:
+            # Find why it failed
+            failed_metrics = []
+            for metric, details in eval_result.get("metrics", {}).items():
+                if details.get("score", 1.0) < 0.6:
+                    failed_metrics.append(f"{metric} (score: {details.get('score')}, reason: {details.get('reason')})")
+            
+            feedback_reason = "; ".join(failed_metrics)
+            feedback_msg = (
+                f"[Koreksi Refleksi Mandiri] Jawaban Anda kurang memenuhi kriteria kualitas (Skor: {overall_score:.2f}). "
+                f"Evaluasi kegagalan: {feedback_reason}. Harap periksa kembali dan perbaiki jawaban Anda agar lebih akurat dan terstruktur."
+            )
+            logger.info(f"Reflection failed. Appending feedback: {feedback_msg}")
+            
+            return {
+                "messages": [HumanMessage(content=feedback_msg)],
+                "reflection_attempts": attempts + 1,
+            }
+    except Exception as eval_err:
+        logger.warning(f"Error during self-reflection evaluation: {eval_err}")
+        
+    return {"reflection_attempts": attempts}
+
+
+def _should_finish(state: AgentState) -> str:
+    """Determine if reflection passed or failed (and needs to loop back)."""
+    messages = state.get("messages", [])
+    
+    # If the last message is a HumanMessage containing our correction prompt, route back to agent
+    if messages and isinstance(messages[-1], HumanMessage) and "[Koreksi Refleksi Mandiri]" in messages[-1].content:
+        return "agent"
+    return END
 
 
 # =============================================================================
@@ -233,7 +283,7 @@ def build_agent_graph() -> Any:
     graph.add_edge("tools", "track_results")
     graph.add_edge("track_results", "agent")
     if s.agent_reflect:
-        graph.add_edge("reflect", END)
+        graph.add_conditional_edges("reflect", _should_finish, {"agent": "agent", END: END})
 
     return graph.compile()
 
@@ -287,6 +337,7 @@ async def run_agent(
     max_steps: int = 10,
     history: list[dict] | None = None,
     tools: list[str] | None = None,
+    session_id: str = "default",
 ) -> dict:
     """Run the agent and return a final dict. Used by /v1/agents/run.
 
@@ -296,17 +347,24 @@ async def run_agent(
     effective_max = max_steps or s.agent_max_steps
     graph = get_agent_graph()
 
-    messages: list = [SystemMessage(content=_load_agent_prompt())]
+    profile_mem = get_profile_memory()
+    profile_context = await profile_mem.get_profile_context(session_id)
+    system_prompt = _load_agent_prompt()
+    if profile_context:
+        system_prompt += f"\n\n{profile_context}"
+
+    messages: list = [SystemMessage(content=system_prompt)]
     if history:
         messages.extend(_history_to_messages(history))
     messages.append(HumanMessage(content=task))
 
     initial_state: AgentState = {
         "messages": messages,
-        "session_id": "",
+        "session_id": session_id,
         "tool_calls_count": 0,
         "error_count": 0,
         "reasoning_steps": [],
+        "reflection_attempts": 0,
     }
 
     try:
@@ -330,6 +388,16 @@ async def run_agent(
             last_results = [s for s in result["reasoning_steps"] if s.get("type") == "tool_result" and s.get("content_preview")]
             if last_results:
                 final_answer = last_results[-1]["content_preview"]
+
+        # Persist to memory and trigger profile update
+        try:
+            mem = get_memory()
+            await mem.add_message(session_id, "user", task)
+            await mem.add_message(session_id, "assistant", final_answer)
+            import asyncio
+            asyncio.create_task(profile_mem.extract_and_update_profile(session_id, task, final_answer))
+        except Exception as mem_err:
+            logger.debug(f"Memory update failed in run_agent: {mem_err}")
 
         return {
             "status": "ok",
@@ -387,8 +455,15 @@ async def run_agent_stream(
         "tools": effective_tools,
     }
 
+    # Load profile memory
+    profile_mem = get_profile_memory()
+    profile_context = await profile_mem.get_profile_context(session_id)
+    system_prompt = _load_agent_prompt()
+    if profile_context:
+        system_prompt += f"\n\n{profile_context}"
+
     # Build messages with history
-    messages: list = [SystemMessage(content=_load_agent_prompt())]
+    messages: list = [SystemMessage(content=system_prompt)]
     if history:
         messages.extend(_history_to_messages(history))
     messages.append(HumanMessage(content=task))
@@ -402,7 +477,14 @@ async def run_agent_stream(
 
     try:
         async for event in graph.astream_events(
-            {"messages": messages, "session_id": session_id, "tool_calls_count": 0, "error_count": 0, "reasoning_steps": []},
+            {
+                "messages": messages,
+                "session_id": session_id,
+                "tool_calls_count": 0,
+                "error_count": 0,
+                "reasoning_steps": [],
+                "reflection_attempts": 0,
+            },
             config=config,
             version="v2",
         ):
@@ -450,6 +532,8 @@ async def run_agent_stream(
             mem = get_memory()
             await mem.add_message(session_id, "user", task)
             await mem.add_message(session_id, "assistant", final_answer)
+            import asyncio
+            asyncio.create_task(profile_mem.extract_and_update_profile(session_id, task, final_answer))
         except Exception as e:
             logger.debug(f"Memory persist failed: {e}")
 

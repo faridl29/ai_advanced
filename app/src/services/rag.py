@@ -237,20 +237,9 @@ async def query_rag_with_answer(
 
     context = "\n\n---\n\n".join(context_parts)
 
-    # Step 3: Generate answer with LLM
-    rag_prompt = f"""You are a helpful assistant that answers questions based on the provided context.
-
-CONTEXT:
-{context}
-
-RULES:
-- Answer based ONLY on the provided context
-- If the context doesn't contain enough information, say so honestly
-- Cite sources using [Source N] notation when referencing specific information
-- Be concise but thorough
-- If the question is in Indonesian, answer in Indonesian
-
-QUESTION: {query} /no_think"""
+    from src.services.prompts import get_prompt
+    rag_prompt_tmpl = get_prompt("rag-prompt")
+    rag_prompt = rag_prompt_tmpl.format(context=context, query=query)
 
     llm = get_llm("rag", model=model)
 

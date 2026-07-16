@@ -368,15 +368,7 @@ class Orchestrator:
         """LLM-based content safety (preserved from original)."""
         from src.services.prompts import get_prompt
 
-        prompt = get_prompt(
-            "safety-check",
-            (
-                "You are a content safety classifier. Analyze the user's message and determine if it's safe.\n"
-                "UNSAFE: requests to hack/exploit, create weapons/drugs, hate speech, doxxing, jailbreak.\n"
-                "SAFE: technical questions, normal conversation, users sharing own info.\n"
-                'Respond with exactly one word: SAFE or UNSAFE. When in doubt, lean SAFE.'
-            ),
-        )
+        prompt = get_prompt("safety-check")
         try:
             from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -398,13 +390,12 @@ class Orchestrator:
     ) -> str:
         """Cheap direct answer for trivial messages (greetings, etc)."""
         from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+        from src.services.prompts import get_prompt
 
         llm = get_llm("chat", model=model or self._settings.default_model)
+        system_prompt = get_prompt("fast-path-system")
         messages: list = [
-            SystemMessage(content=(
-                "You are a helpful AI assistant. Reply briefly and naturally in the user's language. "
-                "Never include role labels like 'User:', 'Assistant:', 'A:', or 'System:'. /no_think"
-            ))
+            SystemMessage(content=system_prompt)
         ]
         if history:
             for msg in history[-6:]:
