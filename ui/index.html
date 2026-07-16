@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Platform — Unified Assistant</title>
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <!-- Marked Markdown Parser -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    
+    <!-- Stylesheet -->
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- SIDEBAR -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <i data-lucide="sparkles" class="logo-icon"></i>
+                    <div>
+                        <h2>AI Platform</h2>
+                        <p>Unified Agent Framework</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="sidebar-content">
+                <!-- MODEL SELECTION -->
+                <div class="config-section">
+                    <span class="section-title">LLM Configuration</span>
+                    <div class="form-group">
+                        <label for="model-select">Active Model</label>
+                        <div class="select-wrapper">
+                            <select id="model-select">
+                                <option value="">Loading models...</option>
+                            </select>
+                            <i data-lucide="chevron-down" class="select-arrow"></i>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- RAG / DOCUMENT INGESTION -->
+                <div class="config-section">
+                    <span class="section-title">Knowledge Base (RAG)</span>
+                    <div id="rag-status-card" class="glass-card flex-between">
+                        <div class="flex-align">
+                            <span class="status-dot status-offline" id="rag-dot"></span>
+                            <span class="rag-text">Qdrant status</span>
+                        </div>
+                        <span class="badge" id="indexed-count">0 docs</span>
+                    </div>
+                    
+                    <div class="upload-zone" id="upload-zone">
+                        <i data-lucide="upload-cloud" class="upload-icon"></i>
+                        <p class="upload-text">Drag & drop files here</p>
+                        <p class="upload-subtext">or click to browse (.pdf, .txt, .docx, .xlsx)</p>
+                        <input type="file" id="file-input" hidden multiple>
+                    </div>
+                    
+                    <div class="upload-progress-container" id="upload-progress-container" style="display: none;">
+                        <div class="progress-bar-wrapper">
+                            <div class="progress-bar-fill" id="upload-progress-fill"></div>
+                        </div>
+                        <span id="upload-progress-text">Uploading file...</span>
+                    </div>
+                    <div id="upload-status-msg" class="upload-status-msg"></div>
+                </div>
+            </div>
+            
+            <div class="sidebar-footer">
+                <button class="btn btn-secondary w-full" id="clear-chat-btn">
+                    <i data-lucide="trash-2"></i> Clear Conversation
+                </button>
+            </div>
+        </aside>
+        
+        <!-- MAIN CHAT INTERFACE -->
+        <main class="chat-container">
+            <!-- HEADER -->
+            <header class="chat-header">
+                <div class="header-left">
+                    <span class="pill pill-info" id="model-pill">Default Model</span>
+                    <span class="pill pill-success" id="intent-pill">Direct Chat</span>
+                </div>
+                <div class="header-right text-dim text-small flex-align gap-4">
+                    <i data-lucide="clock" class="icon-small"></i>
+                    <span>Latency: </span><span id="latency-val">0.0ms</span>
+                </div>
+            </header>
+            
+            <!-- CHAT AREA -->
+            <div class="chat-messages" id="chat-messages">
+                <!-- EMPTY STATE -->
+                <div class="empty-state" id="empty-state">
+                    <div class="empty-header">
+                        <h1>What can I help with today?</h1>
+                        <p>Ask a question, upload spreadsheets/documents for financial analysis, or delegate multi-step agent tasks.</p>
+                    </div>
+                    <div class="quick-actions">
+                        <button class="qa-card" data-prompt="Lakukan analisis finansial untuk data berikut: {"revenue": 100000000, "net_income": 15000000, "total_assets": 80000000, "total_equity": 50000000}. Tampilkan tabel rasio finansialnya.">
+                            <div class="qa-icon"><i data-lucide="trending-up"></i></div>
+                            <div class="qa-content">
+                                <div class="qa-title">Financial Ratio Analysis</div>
+                                <div class="qa-desc">Compute ROE, ROA, DER from raw numbers</div>
+                            </div>
+                        </button>
+                        <button class="qa-card" data-prompt="Berapa hasil dari 124 * 78 + (512 - 256) / 2? Tunjukkan langkah pengerjaannya.">
+                            <div class="qa-icon"><i data-lucide="calculator"></i></div>
+                            <div class="qa-content">
+                                <div class="qa-title">Math & Calculations</div>
+                                <div class="qa-desc">Trigger python/calculator execution tools</div>
+                            </div>
+                        </button>
+                        <button class="qa-card" data-prompt="Cari informasi terbaru di web mengenai berita teknologi AI minggu ini.">
+                            <div class="qa-icon"><i data-lucide="globe"></i></div>
+                            <div class="qa-content">
+                                <div class="qa-title">Web Search</div>
+                                <div class="qa-desc">Search the web for current events</div>
+                            </div>
+                        </button>
+                        <button class="qa-card" data-prompt="Halo! Siapa namamu dan apa saja kemampuanmu?">
+                            <div class="qa-icon"><i data-lucide="message-square"></i></div>
+                            <div class="qa-content">
+                                <div class="qa-title">Direct Conversation</div>
+                                <div class="qa-desc">Chat naturally with the model</div>
+                            </div>
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- INPUT AREA -->
+            <footer class="chat-input-area">
+                <form id="chat-form">
+                    <div class="input-container">
+                        <textarea id="chat-input" placeholder="Type your message here..." rows="1" required></textarea>
+                        <button type="submit" class="btn-send" id="btn-send">
+                            <i data-lucide="send"></i>
+                        </button>
+                    </div>
+                </form>
+                <div class="disclaimer-text">
+                    Agent has access to Web Search, Document RAG, Financial Calculator and Python Execution.
+                </div>
+            </footer>
+        </main>
+    </div>
+    
+    <!-- Scripts -->
+    <script src="app.js"></script>
+</body>
+</html>

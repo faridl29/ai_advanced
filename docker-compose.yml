@@ -205,31 +205,12 @@ services:
     networks:
       - ai-net
 
-  # ============================================================================
-  # TAHAP 8: UI + REVERSE PROXY
-  # ============================================================================
-
-  ui:
-    build: ./ui
-    container_name: ai-ui
-    environment:
-      API_BASE_URL: http://app:8080
-      DEFAULT_MODEL: ${DEFAULT_MODEL:-qwen3:4b}
-    ports:
-      - "8501:8501"
-    depends_on:
-      app:
-        condition: service_healthy
-    restart: unless-stopped
-    mem_limit: 512m
-    networks:
-      - ai-net
-
   nginx:
     image: nginx:alpine
     container_name: ai-nginx
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./ui:/usr/share/nginx/html:ro
     ports:
       - "8000:80"
     depends_on:
