@@ -32,3 +32,6 @@ spacy>=3.7
 
 # Observability — Langfuse prompt management + tracing
 langfuse>=2.50
+
+# Report generation — Excel output
+openpyxl>=3.1

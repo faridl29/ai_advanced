@@ -2,15 +2,15 @@
 # All models route through Ollama running on same Docker network
 
 model_list:
-  - model_name: qwen3:1.7b
+  - model_name: qwen3:4b
     litellm_params:
-      model: ollama/qwen3:1.7b
+      model: ollama/qwen3:4b
       api_base: http://ollama:11434
       stream: true
       # Enable qwen3 thinking mode. Reasoning blocks stream first, then
       # the final answer. UI exposes them in a collapsible "Reasoning"
       # expander so users can see how the model arrived at its answer.
-      think: true
+      think: false
 
   # === Embedding model ===
   - model_name: nomic-embed
@@ -21,7 +21,7 @@ model_list:
 # Router settings
 router_settings:
   num_retries: 2
-  timeout: 120
+  timeout: 300
   enable_caching: true
   cache_params:
     type: redis
@@ -35,7 +35,7 @@ general_settings:
 
 litellm_settings:
   drop_params: true
-  request_timeout: 120
+  request_timeout: 300
   telemetry: false
   set_verbose: false
   success_callback: ["langfuse"]

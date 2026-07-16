@@ -9,13 +9,14 @@ Premium dark-themed interface with:
 """
 import json
 import os
+import re
 
 import requests
 import streamlit as st
 
 API_URL = os.getenv("API_BASE_URL", "http://app:8080")
 # Default to settings.default_model — single source of truth.
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:1.7b")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3:4b")
 STREAM_URL = f"{API_URL}/v1/chat/stream"
 
 
@@ -730,6 +731,25 @@ def _process_prompt(prompt: str, model: str) -> None:
                 unsafe_allow_html=True,
             )
 
+        # Excel download button if response contains report link
+        report_match = re.search(r"/v1/reports/([\w._-]+\.xlsx)", content_text)
+        if report_match:
+            report_filename = report_match.group(1)
+            try:
+                dl_url = f"{API_URL}/v1/reports/{report_filename}"
+                dl_resp = requests.get(dl_url, timeout=10)
+                if dl_resp.status_code == 200:
+                    st.download_button(
+                        label="📥 Download Excel Report",
+                        data=dl_resp.content,
+                        file_name=report_filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        use_container_width=True,
+                    )
+            except Exception:
+                pass
+
         # Persist to session state for history re-render
         st.session_state.messages.append(
             {
@@ -777,7 +797,7 @@ with st.sidebar:
 
     st.markdown('<div class="section-title">Knowledge Base</div>', unsafe_allow_html=True)
     uploaded = st.file_uploader(
-        "Upload", type=["txt", "md", "pdf", "docx"], label_visibility="collapsed"
+        "Upload", type=["txt", "md", "pdf", "docx", "xlsx"], label_visibility="collapsed"
     )
     if uploaded and st.button("📥 Ingest", type="primary", use_container_width=True):
         with st.spinner("Ingesting..."):
@@ -870,10 +890,10 @@ st.markdown(
 # Empty state with quick actions
 if not st.session_state.messages:
     quick_prompts = [
+        ("📊", "Analisis laporan keuangan", "dari dokumen yang sudah di-upload"),
+        ("💰", "Hitung rasio keuangan", "Revenue 500M, Net Income 100M, Assets 1B, Equity 600M"),
+        ("📥", "Buatkan Excel report", "analisis keuangan lengkap dengan rasio"),
         ("💡", "Explain machine learning", "in simple terms"),
-        ("🧮", "Calculate 15 * 37 + 42", "test the agent path"),
-        ("✍️", "Write a haiku", "about Python and AI"),
-        ("🌍", "Translate to Indonesian", "'Good morning, how are you?'"),
     ]
     cols = st.columns(2)
     for i, (icon, title, desc) in enumerate(quick_prompts):

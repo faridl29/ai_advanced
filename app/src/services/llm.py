@@ -19,12 +19,12 @@ def _profile_defaults(profile: LLMProfile) -> dict:
     """Return (temperature, max_tokens, request_timeout) for a given profile."""
     if profile == "classifier":
         # Fast, deterministic, short output (e.g. intent labels).
-        return {"temperature": 0.0, "max_tokens": 20, "request_timeout": 60}
+        return {"temperature": 0.0, "max_tokens": 20, "request_timeout": 120}
     if profile == "rag":
         # Slightly cooler than chat, larger context window.
-        return {"temperature": 0.3, "max_tokens": 1024, "request_timeout": 90}
+        return {"temperature": 0.3, "max_tokens": 1024, "request_timeout": 300}
     # chat (default)
-    return {"temperature": 0.7, "max_tokens": 1024, "request_timeout": 90}
+    return {"temperature": 0.7, "max_tokens": 2048, "request_timeout": 300}
 
 
 def get_llm(

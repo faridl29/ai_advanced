@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     environment: Literal["dev", "staging", "prod"] = "dev"
 
     # LLM
-    default_model: str = "qwen3:1.7b"
+    default_model: str = "qwen3:4b"
     litellm_base_url: str = "http://litellm:4000"
     litellm_master_key: str = "sk-dev-master-key"
     ollama_base_url: str = "http://ollama:11434"
@@ -33,10 +33,31 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
 
     # Timeouts
-    request_timeout: int = 120
+    request_timeout: int = 300
 
-    # Agent
-    agent_model: str = "qwen3:1.7b"
+    # Agent — full agentic ReAct executor
+    # NOTE: must match a model defined in litellm/config.yaml AND pulled in ollama
+    agent_model: str = "qwen3:4b"
+    agent_max_steps: int = 6  # smaller model = fewer steps untuk avoid loop
+    agent_temperature: float = 0.1
+    agent_max_tokens: int = 2048
+    agent_stream: bool = True
+    agent_reflect: bool = False  # Reflection node (verify answer before emit)
+    agent_think_tool: bool = False  # Disabled: think tool causes loops di small models
+
+    # Memory backend
+    memory_backend: Literal["memory", "redis"] = "memory"
+    memory_max_turns: int = 10
+
+    # Tool registry
+    tools_enabled: list[str] = [
+        "calculator", "current_datetime", "knowledge_base",
+        "web_search", "python_executor", "think",
+        "financial_analyzer", "generate_excel_report",
+    ]
+
+    # Reports
+    reports_dir: str = "/app/reports"
 
 
 @lru_cache

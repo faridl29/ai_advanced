@@ -9,7 +9,7 @@ from fastapi.responses import ORJSONResponse
 
 from src.core.config import get_settings
 from src.core.lifespan import lifespan
-from src.api.routes import agents, chat, guardrails, health, rag, structured
+from src.api.routes import agents, chat, guardrails, health, rag, reports, structured
 
 settings = get_settings()
 
@@ -48,6 +48,7 @@ app.include_router(chat.router, prefix="/v1", tags=["chat"])
 app.include_router(structured.router, prefix="/v1", tags=["structured"])
 app.include_router(rag.router, prefix="/v1", tags=["rag"])
 app.include_router(agents.router, prefix="/v1", tags=["agents"])
+app.include_router(reports.router, prefix="/v1", tags=["reports"])
 app.include_router(guardrails.router, prefix="/v1", tags=["guardrails"])
 
 

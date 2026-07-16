@@ -1,4 +1,4 @@
-"""Unified chat route — single entry point that orchestrates all AI capabilities."""
+"""Unified chat route — single entry point for the full-agentic platform."""
 from __future__ import annotations
 
 import json
@@ -23,11 +23,15 @@ class ChatMessage(BaseModel):
 
 
 class UnifiedChatRequest(BaseModel):
-    """Unified chat request — the orchestrator decides how to handle it."""
+    """Unified chat request — the agent decides how to handle it."""
     message: str = Field(..., description="User's message")
     history: list[ChatMessage] | None = Field(None, description="Conversation history")
     model: str | None = Field(None, description="Override model (default: settings)")
-    force_intent: str | None = Field(None, description="Force routing: 'direct_chat', 'rag_query', 'agent_task'")
+    force_intent: str | None = Field(
+        None,
+        description="DEPRECATED. Accepted for backward compat but ignored in full-agentic mode.",
+    )
+    session_id: str | None = Field(None, description="Session ID for memory (streaming only)")
 
 
 class LegacyChatRequest(BaseModel):
@@ -39,28 +43,25 @@ class LegacyChatRequest(BaseModel):
 
 
 # =============================================================================
-# UNIFIED ENDPOINT (PRIMARY)
+# UNIFIED ENDPOINT
 # =============================================================================
 
 @router.post("/chat")
 async def unified_chat(body: UnifiedChatRequest) -> ORJSONResponse:
-    """
-    Unified AI chat endpoint — the orchestrator handles everything:
+    """Unified AI chat endpoint — the agent handles everything.
+
+    Flow:
     1. Input guardrails (safety + PII detection)
-    2. Intent classification (auto-route to chat/RAG/agent)
-    3. Execution via appropriate pipeline
+    2. Optional fast path (trivial messages skip the agent)
+    3. Full-agentic ReAct: agent decides which tools to use
     4. Output guardrails
     5. Response with full metadata
 
-    Use `force_intent` to override auto-classification:
-    - 'direct_chat': Simple LLM chat
-    - 'rag_query': Search documents + generate answer
-    - 'agent_task': Use tools (calculator, knowledge_base, etc.)
+    The `force_intent` field is deprecated in full-agentic mode.
     """
     from src.services.orchestrator import get_orchestrator
 
     orchestrator = get_orchestrator()
-
     history = None
     if body.history:
         history = [{"role": m.role, "content": m.content} for m in body.history]
@@ -71,19 +72,19 @@ async def unified_chat(body: UnifiedChatRequest) -> ORJSONResponse:
         model=body.model,
         force_intent=body.force_intent,
     )
-
     return ORJSONResponse(content=result.to_dict())
 
 
 @router.post("/chat/stream")
 async def unified_chat_stream(body: UnifiedChatRequest):
-    """Streaming chat — Server-Sent Events.
+    """Streaming chat — Server-Sent Events from the agent.
 
     Yields JSON-encoded events:
-      - {event: "metadata", intent, model_used}
-      - {event: "thinking", delta}    (qwen3 reasoning block)
-      - {event: "content", delta}     (final answer chunks)
-      - {event: "done", answer, sources, latency_ms, ...}
+      - {event: "metadata", intent, model_used, path, session_id}
+      - {event: "tool_start", tool, args}
+      - {event: "tool_end", tool, output_preview}
+      - {event: "content", delta}      (final answer chunks)
+      - {event: "done", answer, tools_used, reasoning_steps, latency_ms, ...}
       - {event: "error", detail}
     """
     from src.services.orchestrator import get_orchestrator
@@ -112,7 +113,7 @@ async def unified_chat_stream(body: UnifiedChatRequest):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable nginx buffering
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -126,7 +127,6 @@ async def chat_completions(request: Request, body: dict[str, Any]) -> ORJSONResp
     """OpenAI-compatible chat completion — proxies to LiteLLM."""
     settings = get_settings()
     body.setdefault("model", settings.default_model)
-
     try:
         r = await request.app.state.http.post("/v1/chat/completions", json=body)
         return ORJSONResponse(content=r.json(), status_code=r.status_code)
@@ -142,7 +142,6 @@ async def completions(request: Request, body: dict[str, Any]) -> ORJSONResponse:
     """Text completion proxy."""
     settings = get_settings()
     body.setdefault("model", settings.default_model)
-
     try:
         r = await request.app.state.http.post("/v1/completions", json=body)
         return ORJSONResponse(content=r.json(), status_code=r.status_code)

@@ -1,7 +1,7 @@
 .PHONY: help up up-full down logs ps health chat chat-raw chat-app chat-unified test-eval backup clean reset model-pull model-list
 
-DEFAULT_MODEL ?= qwen3:1.7b
-FALLBACK_MODEL ?= qwen3:1.7b
+DEFAULT_MODEL ?= qwen3:4b
+FALLBACK_MODEL ?= qwen3:4b
 
 # Auto-detect docker compose command
 DC := $(shell command -v docker-compose 2>/dev/null)
@@ -80,21 +80,21 @@ chat: ## Chat test via LiteLLM (OpenAI-compatible)
 	@curl -sS http://localhost:4000/v1/chat/completions \
 		-H "Content-Type: application/json" \
 		-H "Authorization: Bearer sk-dev-master-key" \
-		-d '{"model":"qwen3:1.7b","messages":[{"role":"user","content":"Hello! Sebutkan 3 ibu kota ASEAN beserta negaranya, dalam format JSON."}],"max_tokens":200}' \
+		-d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Hello! Sebutkan 3 ibu kota ASEAN beserta negaranya, dalam format JSON."}],"max_tokens":200}' \
 		2>&1 | python3 -m json.tool 2>/dev/null || echo "(raw response — install python3 for pretty print)"
 	@echo ""
 
 chat-raw: ## Chat test directly to Ollama (bypass LiteLLM)
 	@echo "💬 Direct chat to Ollama..."
 	@curl -sS http://localhost:11434/api/generate \
-		-d '{"model":"qwen3:1.7b","prompt":"Hello, who are you?","stream":false}' \
+		-d '{"model":"qwen3:4b","prompt":"Hello, who are you?","stream":false}' \
 		2>&1 | python3 -m json.tool 2>/dev/null || echo "(raw response)"
 
 chat-app: ## Chat test via FastAPI app
 	@echo "💬 Chat via FastAPI app..."
 	@curl -sS http://localhost:8080/v1/chat/completions \
 		-H "Content-Type: application/json" \
-		-d '{"model":"qwen3:1.7b","messages":[{"role":"user","content":"Apa itu machine learning? Jawab dalam 2 kalimat."}],"max_tokens":100}' \
+		-d '{"model":"qwen3:4b","messages":[{"role":"user","content":"Apa itu machine learning? Jawab dalam 2 kalimat."}],"max_tokens":100}' \
 		2>&1 | python3 -m json.tool 2>/dev/null || echo "(raw response)"
 
 chat-unified: ## Test unified orchestrator endpoint (auto-routing)

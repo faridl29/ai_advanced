@@ -11,11 +11,9 @@ Benefits:
 - One place to find every prompt in the system
 
 Prompt names (must match the Langfuse UI):
-- intent-classifier
-- safety-check
-- direct-chat-system
-- rag-answer-system
-- query-reformulation
+- agent-system         (full-agentic ReAct system prompt)
+- safety-check         (LLM-based content safety)
+- think-tool-description
 """
 from __future__ import annotations
 

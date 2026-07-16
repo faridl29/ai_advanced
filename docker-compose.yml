@@ -85,7 +85,6 @@ services:
       start_period: 15s
     restart: unless-stopped
     mem_limit: 6g
-    cpus: "3"
     networks:
       - ai-net
 
@@ -147,6 +146,8 @@ services:
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-qwen3:4b}
+    volumes:
+      - ./data/reports:/app/reports
     ports:
       - "8080:8080"
     depends_on:
@@ -213,7 +214,7 @@ services:
     container_name: ai-ui
     environment:
       API_BASE_URL: http://app:8080
-      DEFAULT_MODEL: ${DEFAULT_MODEL:-qwen3:1.7b}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-qwen3:4b}
     ports:
       - "8501:8501"
     depends_on:

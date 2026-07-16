@@ -1,29 +1,38 @@
-"""Agent service — production-grade LangGraph agent with reliable tool calling.
+"""Agent service — production-grade full-agentic ReAct executor.
 
-Features:
-- Uses qwen2.5 model (better tool calling than phi3)
-- Structured output fallback when tool calling fails
-- Multiple tools: calculator, datetime, knowledge_base, web_search
-- Graceful error handling with retry logic
-- Full Langfuse tracing
+Architecture (post-refactor):
+- Single brain: every request flows through the agent
+- The agent decides autonomously which tools to call (RAG, calculator, etc.)
+- Multi-tool sequences are first-class (e.g. RAG → calculator → answer)
+- Streaming: emits typed events for tool start/end + content deltas
+- Pluggable tool registry (see src/services/tools/)
+- Pluggable memory backend (see src/services/memory.py)
+- LangGraph checkpointer for short-term conversation memory
+
+Backward compat:
+- `run_agent(task, model, max_steps, history)` still works (legacy single-shot)
+- `run_agent_stream()` is the new streaming API
+- Graph is built once and cached
 """
 from __future__ import annotations
 
-import json
 import logging
-import re
+import time
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, AsyncIterator
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
-from langgraph.graph import END, StateGraph
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
 from src.core.config import get_settings
+from src.services.llm import get_llm
+from src.services.memory import get_memory
+from src.services.prompts import get_prompt
+from src.services.tools import get_tools
+from src.utils.text import strip_think as _strip_think
 
 logger = logging.getLogger(__name__)
 
@@ -32,153 +41,69 @@ logger = logging.getLogger(__name__)
 # STATE
 # =============================================================================
 
-class AgentState(TypedDict):
-    """State for the agent graph."""
+class AgentState(TypedDict, total=False):
+    """Mutable state for the agent graph."""
     messages: Annotated[list, add_messages]
+    session_id: str
     tool_calls_count: int
     error_count: int
+    reasoning_steps: list[dict]  # observability trace
 
 
 # =============================================================================
-# TOOLS — Decorated with @tool for LangGraph compatibility
+# PROMPTS
 # =============================================================================
 
-@tool
-def calculator(expression: str) -> str:
-    """Evaluate a mathematical expression. Supports +, -, *, /, **, (), sqrt().
-    Examples: '2 + 3 * 4', '(15 * 37) + 42', '2**10', 'sqrt(144)'
-    """
-    try:
-        import math
-        # Whitelist safe operations
-        safe_expr = expression.strip()
-        # Allow: digits, operators, parens, dots, spaces, math functions
-        allowed_pattern = re.compile(r'^[0-9+\-*/.() ,sqrtpowabsminmax]+$')
-        if not allowed_pattern.match(safe_expr):
-            return f"Error: Expression contains invalid characters. Use only numbers and operators (+, -, *, /, **, ())"
+AGENT_SYSTEM_FALLBACK = """You are a helpful AI assistant with access to tools. Use them to provide accurate answers.
 
-        # Replace common math functions
-        safe_expr = safe_expr.replace("sqrt", "math.sqrt")
-        safe_expr = safe_expr.replace("pow", "math.pow")
-        safe_expr = safe_expr.replace("abs", "abs")
+You have access to these tools:
+- calculator: For math operations (expressions like "2+2", "sqrt(144)")
+- python_executor: For complex calculations, data processing, or string manipulation
+- knowledge_base: To search uploaded documents and internal knowledge
+- web_search: To search the web for current information
+- current_datetime: For current date/time info
+- think: Your private scratchpad for chain-of-thought (NOT shown to user)
+- financial_analyzer: Compute financial ratios (ROE, ROA, DER, etc.) and investment assessment from JSON data
+- generate_excel_report: Generate a downloadable Excel (.xlsx) report from financial analysis results
 
-        # Evaluate safely
-        result = eval(safe_expr, {"__builtins__": {}, "math": math, "abs": abs}, {})
-        return f"Result: {result}"
-    except ZeroDivisionError:
-        return "Error: Division by zero"
-    except Exception as e:
-        return f"Error calculating: {e}"
+DECISION RULES:
+1. For math questions → ALWAYS use calculator or python_executor
+2. For questions about documents/files/company data → use knowledge_base FIRST
+3. For date/time questions → use current_datetime
+4. For recent events → use web_search
+5. For complex multi-step tasks → use think first to plan, then call other tools
+6. You can call MULTIPLE tools in sequence (e.g. knowledge_base → financial_analyzer → generate_excel_report)
+7. If a tool returns an error, try a different tool or answer from your own knowledge
+8. After all needed tool calls, give a clear final answer in the user's language
 
+FINANCIAL ANALYSIS RULES:
+9. When user asks about financial analysis, ratios, or investment assessment:
+   a. FIRST use knowledge_base to retrieve the financial data from uploaded documents
+   b. THEN extract key figures (revenue, net_income, total_assets, total_equity, etc.)
+   c. THEN call financial_analyzer with the extracted data as JSON
+   d. If user asks for Excel/download, THEN call generate_excel_report with the analysis output
+10. Always format financial data as markdown tables in your final answer
+11. When presenting financial figures, use proper number formatting (e.g. Rp 500.000.000 or 500M)
 
-@tool
-def current_datetime() -> str:
-    """Get the current date, time, and timezone. Use when asked about today's date or current time."""
-    now = datetime.now()
-    return (
-        f"Current date and time: {now.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"(Timezone: {now.astimezone().tzname()}, "
-        f"Day: {now.strftime('%A')}, "
-        f"Week: {now.isocalendar()[1]})"
-    )
+Answer in the same language as the user's question. Be concise but thorough."""
 
 
-@tool
-def knowledge_base(query: str) -> str:
-    """Search the internal knowledge base / document store for information.
-    Use when the user asks about documents, files, company info, or specific knowledge.
-    Returns relevant text passages from indexed documents.
-    """
-    import asyncio
-    from src.services.rag import query_rag
-
-    try:
-        # Run async function in sync context
-        try:
-            loop = asyncio.get_running_loop()
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                result = pool.submit(asyncio.run, query_rag(query, top_k=3)).result()
-        except RuntimeError:
-            result = asyncio.run(query_rag(query, top_k=3))
-
-        if not result["chunks"]:
-            return "No relevant documents found in the knowledge base."
-
-        texts = []
-        for i, c in enumerate(result["chunks"], 1):
-            src = c["metadata"].get("filename", "unknown")
-            score = c.get("score", 0)
-            texts.append(f"[Source {i}: {src} (score: {score:.2f})]\n{c['text'][:400]}")
-        return "\n\n---\n\n".join(texts)
-    except Exception as e:
-        return f"Error searching knowledge base: {e}"
-
-
-@tool
-def web_search(query: str) -> str:
-    """Search the web for current information. Use when asked about recent events,
-    current news, or information that might not be in the knowledge base.
-    Note: This is a simulated search for the local platform.
-    """
-    # In production, integrate with SearXNG or similar local search
-    return (
-        f"[Web Search Stub] Search for: '{query}'\n"
-        "Note: Web search is not yet configured. To enable, deploy SearXNG "
-        "and configure the SEARXNG_URL environment variable.\n"
-        "For now, I'll answer based on my training knowledge."
-    )
-
-
-@tool
-def python_executor(code: str) -> str:
-    """Execute simple Python code for data processing or calculations.
-    Only basic operations allowed (no imports, no file I/O, no network).
-    Use for complex calculations, string processing, or data manipulation.
-    """
-    try:
-        # Strict sandbox
-        forbidden = ["import", "open(", "exec(", "eval(", "__", "os.", "sys.",
-                     "subprocess", "requests", "http", "socket"]
-        for f in forbidden:
-            if f in code:
-                return f"Error: '{f}' is not allowed for security reasons."
-
-        # Execute in restricted namespace
-        namespace: dict = {"__builtins__": {"len": len, "str": str, "int": int,
-                                            "float": float, "list": list, "dict": dict,
-                                            "range": range, "enumerate": enumerate,
-                                            "sorted": sorted, "sum": sum, "min": min,
-                                            "max": max, "abs": abs, "round": round,
-                                            "zip": zip, "map": map, "filter": filter,
-                                            "print": print, "type": type, "isinstance": isinstance}}
-        exec(code, namespace)
-
-        # Return any variable named 'result' or the last assignment
-        if "result" in namespace:
-            return f"Result: {namespace['result']}"
-        return "Code executed successfully (no 'result' variable set)."
-    except Exception as e:
-        return f"Error: {e}"
-
-
-# All available tools
-TOOLS = [calculator, current_datetime, knowledge_base, web_search, python_executor]
+def _load_agent_prompt() -> str:
+    return get_prompt("agent-system", AGENT_SYSTEM_FALLBACK)
 
 
 # =============================================================================
-# LLM CONFIGURATION
+# LLM CONFIG
 # =============================================================================
 
-def _get_agent_llm(model: str | None = None) -> ChatOpenAI:
-    """Create LLM optimized for tool calling (uses qwen3:4b by default)."""
+def _get_agent_llm(model: str | None = None, streaming: bool = False):
     s = get_settings()
-    return ChatOpenAI(
-        model=model or "qwen3:4b",  # qwen3:4b has thinking mode + better tool calling
-        base_url=f"{s.litellm_base_url}/v1",
-        api_key=s.litellm_master_key,
-        temperature=0.1,
-        max_tokens=1024,
+    return get_llm(
+        "chat",
+        model=model or s.agent_model,
+        temperature=s.agent_temperature,
+        max_tokens=s.agent_max_tokens,
+        streaming=streaming,
     )
 
 
@@ -186,205 +111,357 @@ def _get_agent_llm(model: str | None = None) -> ChatOpenAI:
 # GRAPH NODES
 # =============================================================================
 
-AGENT_SYSTEM_PROMPT = """You are a helpful AI assistant with access to tools. Use them to provide accurate answers.
-
-Available tools:
-- calculator: For math operations (expressions like "2+2", "sqrt(144)")
-- current_datetime: For current date/time info
-- knowledge_base: To search uploaded documents and internal knowledge
-- web_search: To search the web for current information
-- python_executor: To run Python code for complex calculations
-
-Rules:
-1. Use tools when they can help provide a better answer
-2. For math questions, ALWAYS use the calculator tool
-3. For questions about documents/files, use knowledge_base
-4. For date/time questions, use current_datetime
-5. After using a tool, interpret the result and give a clear final answer
-6. If a tool returns an error, try an alternative approach or answer from knowledge"""
-
-
 def _should_continue(state: AgentState) -> str:
-    """Decide whether to call tools or finish."""
-    messages = state["messages"]
-    last = messages[-1]
+    """Decide next node: tools (call) / reflect (verify) / END."""
+    s = get_settings()
+    messages = state.get("messages", [])
 
-    # Safety: stop if too many tool calls
-    if state.get("tool_calls_count", 0) >= 5:
+    # Guard: hard cap on tool calls
+    if state.get("tool_calls_count", 0) >= s.agent_max_steps:
+        logger.info(f"Max steps reached ({s.agent_max_steps}), ending")
         return END
 
-    # Stop if too many errors
+    # Guard: too many errors → bail
     if state.get("error_count", 0) >= 3:
+        logger.warning("Too many errors, ending")
         return END
 
+    last = messages[-1] if messages else None
+    if last is None:
+        return END
+
+    # Has tool_calls → go to tools node
     if hasattr(last, "tool_calls") and last.tool_calls:
         return "tools"
+
+    # Optional: reflect node (only valid if it was registered in build_agent_graph)
+    if s.agent_reflect:
+        return "reflect"
     return END
 
 
-def _call_model(state: AgentState) -> dict:
-    """Call the LLM with tools bound."""
-    llm = _get_agent_llm()
+async def _call_model(state: AgentState) -> dict:
+    """Call the LLM with tools bound. Async for streaming support."""
+    s = get_settings()
+    llm = _get_agent_llm(streaming=False)
+    tools = get_tools(s.tools_enabled)
+    llm_with_tools = llm.bind_tools(tools) if tools else llm
 
     try:
-        llm_with_tools = llm.bind_tools(TOOLS)
-        response = llm_with_tools.invoke(state["messages"])
+        response = await llm_with_tools.ainvoke(state["messages"])
 
-        # Track tool calls
         tool_count = state.get("tool_calls_count", 0)
         if hasattr(response, "tool_calls") and response.tool_calls:
             tool_count += len(response.tool_calls)
 
-        return {"messages": [response], "tool_calls_count": tool_count}
+        # Track reasoning steps for observability
+        steps = list(state.get("reasoning_steps", []))
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            for tc in response.tool_calls:
+                steps.append({
+                    "type": "tool_call",
+                    "tool": tc["name"],
+                    "args": tc.get("args", {}),
+                })
+
+        return {
+            "messages": [response],
+            "tool_calls_count": tool_count,
+            "reasoning_steps": steps,
+        }
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
         error_count = state.get("error_count", 0) + 1
-        # Fallback: try without tools
         try:
-            response = _get_agent_llm().invoke(state["messages"])
+            # Retry without tools
+            response = await _get_agent_llm().ainvoke(state["messages"])
             return {"messages": [response], "error_count": error_count}
         except Exception as e2:
-            error_msg = AIMessage(content=f"I encountered an error processing your request. Error: {e2}")
-            return {"messages": [error_msg], "error_count": error_count}
+            err = AIMessage(content=f"I encountered an error: {e2}")
+            return {"messages": [err], "error_count": error_count}
 
 
-def _handle_tool_error(state: AgentState) -> dict:
-    """Handle tool execution errors gracefully."""
-    messages = state["messages"]
-    last = messages[-1]
-    if isinstance(last, ToolMessage) and "Error" in (last.content or ""):
-        error_count = state.get("error_count", 0) + 1
-        return {"error_count": error_count}
+def _track_tool_results(state: AgentState) -> dict:
+    """Append tool results to reasoning_steps (called after ToolNode)."""
+    messages = state.get("messages", [])
+    steps = list(state.get("reasoning_steps", []))
+    for m in messages:
+        # ToolMessage is the result of a tool call
+        from langchain_core.messages import ToolMessage
+        if isinstance(m, ToolMessage):
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            steps.append({
+                "type": "tool_result",
+                "tool": m.name,
+                "content_preview": content[:200],
+            })
+    return {"reasoning_steps": steps}
+
+
+def _reflect(state: AgentState) -> dict:
+    """Optional: verify the final answer. Currently a no-op stub."""
+    # Future: use a lightweight LLM call to check groundedness / quality
     return {}
 
 
 # =============================================================================
-# GRAPH CONSTRUCTION
+# GRAPH BUILDER
 # =============================================================================
 
-def build_agent_graph() -> StateGraph:
-    """Build the agent graph with tool calling and error handling."""
+def build_agent_graph() -> Any:
+    """Compile the agent graph. Cached as singleton."""
+    s = get_settings()
     graph = StateGraph(AgentState)
 
-    # Nodes
     graph.add_node("agent", _call_model)
-    graph.add_node("tools", ToolNode(TOOLS))
+    graph.add_node("tools", ToolNode(get_tools(s.tools_enabled)))
+    if s.agent_reflect:
+        graph.add_node("reflect", _reflect)
+    # After tools run, record the results back into reasoning_steps
+    graph.add_node("track_results", _track_tool_results)
 
-    # Edges
-    graph.set_entry_point("agent")
-    graph.add_conditional_edges("agent", _should_continue, {"tools": "tools", END: END})
-    graph.add_edge("tools", "agent")
+    # Build the path map. If `agent_reflect` is disabled, the 'reflect'
+    # branch must route to END because the node is not registered.
+    path_map: dict[str, str] = {"tools": "tools", END: END}
+    if s.agent_reflect:
+        path_map["reflect"] = "reflect"
+    else:
+        path_map["reflect"] = END
+
+    graph.add_edge(START, "agent")
+    graph.add_conditional_edges("agent", _should_continue, path_map)
+    graph.add_edge("tools", "track_results")
+    graph.add_edge("track_results", "agent")
+    if s.agent_reflect:
+        graph.add_edge("reflect", END)
 
     return graph.compile()
 
 
-# Singleton compiled graph
-_agent = None
+# =============================================================================
+# SINGLETON
+# =============================================================================
+
+_agent_graph = None
 
 
-def get_agent():
-    global _agent
-    if _agent is None:
-        _agent = build_agent_graph()
-    return _agent
+def get_agent_graph():
+    global _agent_graph
+    if _agent_graph is None:
+        _agent_graph = build_agent_graph()
+    return _agent_graph
 
+
+def invalidate_agent_cache() -> None:
+    """Force rebuild on next call (useful after config changes)."""
+    global _agent_graph
+    _agent_graph = None
+
+
+# =============================================================================
+# HISTORY MANAGEMENT
+# =============================================================================
+
+def _history_to_messages(history: list[dict]) -> list:
+    """Convert [{"role", "content"}] to LangChain messages."""
+    out: list = []
+    for m in history:
+        role = m.get("role")
+        content = m.get("content", "")
+        if role == "user":
+            out.append(HumanMessage(content=content))
+        elif role == "assistant":
+            out.append(AIMessage(content=content))
+        elif role == "system":
+            out.append(SystemMessage(content=content))
+    return out
+
+
+# =============================================================================
+# LEGACY SINGLE-SHOT (backward compat)
+# =============================================================================
 
 async def run_agent(
     task: str,
     model: str | None = None,
     max_steps: int = 10,
     history: list[dict] | None = None,
+    tools: list[str] | None = None,
 ) -> dict:
+    """Run the agent and return a final dict. Used by /v1/agents/run.
+
+    For new code, prefer `run_agent_stream` for observability.
     """
-    Run the agent with a task.
+    s = get_settings()
+    effective_max = max_steps or s.agent_max_steps
+    graph = get_agent_graph()
 
-    Args:
-        task: The user's task/question
-        model: Override model (default: qwen2.5)
-        max_steps: Maximum number of reasoning steps
-        history: Previous conversation context
-
-    Returns:
-        Dictionary with answer, tools_used, steps, reasoning
-    """
-    agent = get_agent()
-
-    # Build messages with optional history
-    messages = [SystemMessage(content=AGENT_SYSTEM_PROMPT)]
-
+    messages: list = [SystemMessage(content=_load_agent_prompt())]
     if history:
-        for msg in history[-6:]:  # Last 3 exchanges
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content=msg["content"]))
-            elif msg["role"] == "assistant":
-                messages.append(AIMessage(content=msg["content"]))
-
+        messages.extend(_history_to_messages(history))
     messages.append(HumanMessage(content=task))
 
     initial_state: AgentState = {
         "messages": messages,
+        "session_id": "",
         "tool_calls_count": 0,
         "error_count": 0,
+        "reasoning_steps": [],
     }
 
     try:
-        # Run graph
-        result = agent.invoke(
+        result = await graph.ainvoke(
             initial_state,
-            config={"recursion_limit": max_steps * 3},
+            config={"recursion_limit": effective_max * 3},
         )
-
-        # Extract final answer and metadata
-        result_messages = result["messages"]
+        msgs = result.get("messages", [])
         final_answer = ""
-        tools_used = []
-        reasoning_steps = []
+        tools_used: list[str] = []
+        for m in msgs:
+            if isinstance(m, AIMessage):
+                if m.content:
+                    final_answer = m.content
+                if hasattr(m, "tool_calls") and m.tool_calls:
+                    for tc in m.tool_calls:
+                        if tc["name"] not in tools_used:
+                            tools_used.append(tc["name"])
 
-        for msg in result_messages:
-            if isinstance(msg, AIMessage):
-                if msg.content:
-                    final_answer = msg.content
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        tools_used.append(tc["name"])
-                        reasoning_steps.append({
-                            "type": "tool_call",
-                            "tool": tc["name"],
-                            "args": tc.get("args", {}),
-                        })
-            elif isinstance(msg, ToolMessage):
-                reasoning_steps.append({
-                    "type": "tool_result",
-                    "content": msg.content[:200] if msg.content else "",
-                })
-
-        # If final_answer is empty (model didn't produce text after tool use),
-        # use the last tool result as the answer
-        if not final_answer and reasoning_steps:
-            last_tool_results = [
-                s for s in reasoning_steps if s["type"] == "tool_result" and s.get("content")
-            ]
-            if last_tool_results:
-                final_answer = last_tool_results[-1]["content"]
+        if not final_answer and result.get("reasoning_steps"):
+            last_results = [s for s in result["reasoning_steps"] if s.get("type") == "tool_result" and s.get("content_preview")]
+            if last_results:
+                final_answer = last_results[-1]["content_preview"]
 
         return {
             "status": "ok",
-            "answer": final_answer,
-            "tools_used": list(set(tools_used)),
-            "steps": len([m for m in result_messages if isinstance(m, (AIMessage, ToolMessage))]),
-            "reasoning": reasoning_steps,
+            "answer": _strip_think(final_answer),
+            "tools_used": tools_used,
+            "steps": len(result.get("reasoning_steps", [])),
+            "reasoning": result.get("reasoning_steps", []),
             "task": task,
-            "model": model or "qwen3:4b",
+            "model": model or s.agent_model,
         }
-
     except Exception as e:
-        logger.error(f"Agent execution failed: {e}")
+        logger.error(f"Agent run failed: {e}")
         return {
             "status": "error",
-            "answer": f"Agent encountered an error: {str(e)}. Please try again.",
+            "answer": f"Agent encountered an error: {e}. Please try again.",
             "tools_used": [],
             "steps": 0,
             "reasoning": [],
             "task": task,
             "error": str(e),
         }
+
+
+# =============================================================================
+# STREAMING API
+# =============================================================================
+
+async def run_agent_stream(
+    task: str,
+    session_id: str = "default",
+    model: str | None = None,
+    history: list[dict] | None = None,
+    tools: list[str] | None = None,
+) -> AsyncIterator[dict]:
+    """Run the agent with full streaming observability.
+
+    Event shapes:
+      {"event": "metadata", "session_id": ..., "model": ..., "tools": [...]}
+      {"event": "reasoning", "delta": "..."}     # from think tool
+      {"event": "tool_start", "tool": "...", "args": {...}}
+      {"event": "tool_end", "tool": "...", "output_preview": "..."}
+      {"event": "content", "delta": "..."}        # final answer chunk
+      {"event": "done", "answer": "...", "tools_used": [...], "latency_ms": ...}
+      {"event": "error", "detail": "..."}
+    """
+    s = get_settings()
+    start = time.perf_counter()
+    effective_model = model or s.agent_model
+    effective_tools = tools or s.tools_enabled
+
+    yield {
+        "event": "metadata",
+        "session_id": session_id,
+        "model": effective_model,
+        "tools": effective_tools,
+    }
+
+    # Build messages with history
+    messages: list = [SystemMessage(content=_load_agent_prompt())]
+    if history:
+        messages.extend(_history_to_messages(history))
+    messages.append(HumanMessage(content=task))
+
+    graph = get_agent_graph()
+    config = {"configurable": {"thread_id": session_id}, "recursion_limit": s.agent_max_steps * 3}
+
+    full_content = ""
+    tools_used: list[str] = []
+    reasoning_steps: list[dict] = []
+
+    try:
+        async for event in graph.astream_events(
+            {"messages": messages, "session_id": session_id, "tool_calls_count": 0, "error_count": 0, "reasoning_steps": []},
+            config=config,
+            version="v2",
+        ):
+            ev_type = event.get("event")
+            name = event.get("name", "")
+
+            # LLM streaming tokens
+            if ev_type == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                if chunk and getattr(chunk, "content", None):
+                    delta = chunk.content
+                    if isinstance(delta, str) and delta:
+                        # If model is in think block, route to reasoning
+                        full_content += delta
+                        yield {"event": "content", "delta": delta}
+
+            # Tool start
+            elif ev_type == "on_tool_start":
+                tool_input = event.get("data", {}).get("input", {})
+                if name not in tools_used:
+                    tools_used.append(name)
+                reasoning_steps.append({"type": "tool_call", "tool": name, "args": tool_input})
+                yield {"event": "tool_start", "tool": name, "args": tool_input}
+
+            # Tool end
+            elif ev_type == "on_tool_end":
+                output = event.get("data", {}).get("output")
+                preview = str(output)[:200] if output is not None else ""
+                reasoning_steps.append({"type": "tool_result", "tool": name, "content_preview": preview})
+                yield {"event": "tool_end", "tool": name, "output_preview": preview}
+
+        elapsed = (time.perf_counter() - start) * 1000
+        final_answer = _strip_think(full_content)
+        yield {
+            "event": "done",
+            "answer": final_answer,
+            "tools_used": tools_used,
+            "reasoning": reasoning_steps,
+            "latency_ms": round(elapsed, 1),
+            "model": effective_model,
+        }
+
+        # Persist to memory (fire-and-forget)
+        try:
+            mem = get_memory()
+            await mem.add_message(session_id, "user", task)
+            await mem.add_message(session_id, "assistant", final_answer)
+        except Exception as e:
+            logger.debug(f"Memory persist failed: {e}")
+
+    except Exception as e:
+        logger.exception("Agent stream failed")
+        yield {"event": "error", "detail": str(e)}
+
+
+__all__ = [
+    "build_agent_graph",
+    "get_agent_graph",
+    "invalidate_agent_cache",
+    "run_agent",
+    "run_agent_stream",
+]
